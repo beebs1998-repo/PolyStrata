@@ -1,10 +1,11 @@
 """Tests for setup.py on a card with less VRAM than the sizes of strata-poly were measured on - a 6 GB NVIDIA
-card (a GTX 1660 SUPER, 6,144 MiB, compute capability 7.5), where no size fits by the 32K figures.  What that path
+card (a GTX 1660 SUPER, 6,144 MiB, compute capability 7.5), where no size fits by the 32K figures.  Named for the
+card: test_setup_small_card.py covers the ~8 GB cards, which fit a size and keep the RAM rule.  What that path
 does: judge at the shortest context offered, because the KV cache is what the card is short of, and take the size
 that puts the most experts in its VRAM.  Every other card keeps the 32K figures and the RAM rule, which the first
 test proves by value.  Mocked - no GPU, no compile, no downloads, nothing written outside a temp folder.
 
-    python -m unittest tools.test_setup_small_card
+    python -m unittest tools.test_setup_small_card_6gb
 """
 from __future__ import annotations
 
