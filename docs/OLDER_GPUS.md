@@ -15,9 +15,12 @@ and their output stay exactly as they were. Numbers are the reporters' own, on o
 | Tesla P40 / P4, GTX 10 series | 6.1 | the CUDA 12 engine | BF16 projections through fp32 (cuBLAS has no BF16 GEMM there, #395) | P40, IQ3_S, engine 0.1.30: prompt 217-374 tok/s, decode 30-33 tok/s (#395) |
 | Tesla V100, Titan V | 7.0 | the CUDA 12 engine | BF16 projections on the FP16 tensor cores (#655, #540); the prompt attention on `mma.m8n8k4` (#600); a leaner attention kernel (#540) | V100-PCIE-32GB, UD-IQ4_XS: prompt 1,123-1,251 tok/s (#600); V100 32GB, IQ2_XS: prompt +22% from #540 |
 | RTX 20 (Turing) | 7.5 | **supported**, the ready-made engine | opt-in: `STRATA_BF16_TC=1` runs the BF16 projections on the FP16 tensor cores | RTX 2080 Ti, Q2_0: prompt +15-18% (#655) |
+| GTX 1660 SUPER, 6 GB (Turing) | 7.5 | the ready-made engine, as RTX 20 | only the smallest size of Qwen3.6 or Gemma 4 fits, at a short context: setup takes it and says so. Most of the model runs on the CPU ([BACKENDS.md](BACKENDS.md#a-card-with-6-gb-of-vram)) | Gemma 4 26B-A4B UD-Q2_K_XL, 16,384-token context, Ryzen 5 3600, Windows 10, driver 580.97: writes 35.0 to 39.2 tokens/s, reads a 10,982-token prompt at 144, 533 of 3,840 experts in VRAM |
 
 A card needs enough VRAM to be useful: 12 GB or more is recommended, as for every card (a 2 GB GT 1030 is compute
-capability 6.1 too, and cannot hold any of the model).
+capability 6.1 too, and cannot hold any of the model). Under 8 GB, setup's own path ([BACKENDS.md](BACKENDS.md#a-card-with-6-gb-of-vram))
+is an estimate that ran about twice as high as the card on the one machine measured; treat the share of experts
+setup prints as an upper bound.
 
 ### AMD
 

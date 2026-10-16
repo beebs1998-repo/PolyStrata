@@ -45,7 +45,9 @@ Requirements (details: [INSTALL.md](INSTALL.md#what-you-need)):
 - **GPU:** NVIDIA RTX 20, 30, 40 or 50 series, or AMD Radeon RX 7900 XT / XTX, RX 7800 XT / 7700 XT, RX 9060 XT,
   RX 9070 / 9070 XT, Radeon AI PRO R9700, RX 6800 / 6900 series; 12 GB of VRAM or more (an NVIDIA card with 8 GB runs,
   slowly). GTX 10 series and older, and integrated GPUs, are not supported; Pascal / Volta cards (P40, V100) and some
-  older AMD cards have experimental paths the user opts into ([OLDER_GPUS.md](OLDER_GPUS.md)).
+  older AMD cards have experimental paths the user opts into ([OLDER_GPUS.md](OLDER_GPUS.md)). A Turing card (the
+  RTX 20 series and the GTX 16 series) with 6 GB of VRAM runs Qwen3.6 or Gemma 4 in their smallest size at an 8K
+  context, slowly, and setup takes that path on its own ([BACKENDS.md](BACKENDS.md#a-card-with-6-gb-of-vram)).
 - **Driver:** NVIDIA 580 or newer. AMD on Linux: the kernel's amdgpu driver; on Windows: a current AMD Adrenalin
   driver. If the driver is missing or too old, tell the user to update it (NVIDIA App / nvidia.com/drivers, or AMD
   Software) and restart; do not install drivers yourself unless they ask.
@@ -90,6 +92,11 @@ about 15 to 28 GB of RAM beside an 8 GB card by setup's estimate, by size. On Wi
 has three sizes. Leave `--model` out: setup takes UD-Q3_K_M (APEX-I-COMPACT for Ornith), or the smallest on a PC
 with too little RAM for it. The largest is by name, `--model UD-Q4_K_M` or `--model APEX-I-QUALITY`.
 Take one only when the user asks for it; [BACKENDS.md](BACKENDS.md#install) has what was measured.
+
+On a card that none of the three sizes fits - 6 GB, where no size fits at a 32K context - setup asks the context
+first and takes UD-Q2_K_XL, the size that puts the most experts in the little VRAM there is, at 8,192 tokens. It
+says so on `--check`. `--tail-skip N` is there for such a card: it leaves out the experts no token of a call ranks
+in its first N, which is less work for the CPU.
 
 ## 4. Run setup without questions
 

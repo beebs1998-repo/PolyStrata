@@ -482,6 +482,8 @@ ENGINE_POLY_DIR = "engine-poly"
 OLD_POLY_EXE = "strata-glm.exe" if WIN else "strata-glm"
 OLD_ENGINE_POLY_DIR = "engine-glm"
 POLY_CONTEXTS = [8192, 32768, 65536, 131072]
+POLY_BESIDE_CTX = 32768         # the context a size's "vram_beside_gb" was measured at (an RTX 5090): its KV cache
+                                # is row_bytes a token, so a shorter context frees that much VRAM for the experts
 GLM_ROW_BYTES = 28160           # VRAM per context token: a row in each of the 11 sparse attention layers' caches
 GLM_VRAM_BESIDE_GB = 12         # what is not expert cache on a 32 GB card at 32K (weights, caches, buffers, reserve):
                                 # the 3.0BIT file's; a size with other dense weights has its own "vram_beside_gb"
@@ -5003,43 +5005,74 @@ def poly_config(cfg: dict) -> bool:
 
 
 # The estimates below take a size's entry: what MODELS, or a family's own "models", says of it (family_models()).
-def poly_beside_gb(d) -> float:
-    """The GiB of VRAM a size takes before any expert, at a 32K context."""
-    return d.get("vram_beside_gb", GLM_VRAM_BESIDE_GB)
+# `ctx` and `row_bytes` are None for the default every caller used: a size's "vram_beside_gb" was measured at
+# POLY_BESIDE_CTX, so without a context the figures are exactly what they were.  A small card, whose VRAM the KV
+# cache decides, passes the context it was given and the family's row_bytes.
+def poly_beside_gb(d, ctx=None, row_bytes=None) -> float:
+    """The GiB of VRAM a size takes before any expert, at a 32K context - the one its figure was measured at.  The
+    KV cache is row_bytes a token, so a shorter context's is smaller and a longer one's larger.  Above 32K that
+    grows without limit: a card that fits a size at 32K is not given a context (poly_setup) and keeps its figure."""
+    base = d.get("vram_beside_gb", GLM_VRAM_BESIDE_GB)
+    if not ctx or not row_bytes:
+        return base
+    return max(0.0, base + (ctx - POLY_BESIDE_CTX) * row_bytes / 2 ** 30)
 
 
-def poly_held_gb(d, vram_gb) -> float:
+def poly_held_gb(d, vram_gb, ctx=None, row_bytes=None) -> float:
     """About the GB of a size's experts a card with this much VRAM (GiB) holds at a 32K context."""
-    return min(d["arena_gb"], max(0.0, vram_gb - poly_beside_gb(d)) * 1.073741824)
+    return min(d["arena_gb"], max(0.0, vram_gb - poly_beside_gb(d, ctx, row_bytes)) * 1.073741824)
 
 
-def poly_default(sizes, ram, vram_gb) -> str:
+def poly_default(sizes, ram, vram_gb, ctx=None, row_bytes=None) -> str:
     """The size setup takes when none is named: the first whose RAM estimate this PC meets, else the one that wants
-    the least."""
-    return next((m for m, d in sizes.items() if ram >= poly_ram_need(d, vram_gb) - 4),
-                min(sizes, key=lambda m: poly_ram_need(sizes[m], vram_gb)))
+    the least.  A card too small for every size by the 32K figure they were measured at - one that no install here
+    could use - takes the size that puts the most experts in its VRAM instead: the RAM rule would pick the largest
+    file, which is the one that leaves the card least room.  Every other card keeps the RAM rule, 8 GB included."""
+    if all(poly_too_small(d, vram_gb) for d in sizes.values()):
+        return max(sizes, key=lambda m: poly_held_gb(sizes[m], vram_gb, ctx, row_bytes))
+    return next((m for m, d in sizes.items() if ram >= poly_ram_need(d, vram_gb, ctx, row_bytes) - 4),
+                min(sizes, key=lambda m: poly_ram_need(sizes[m], vram_gb, ctx, row_bytes)))
 
 
-def poly_ram_need(d, vram_gb) -> float:
+def poly_ram_need(d, vram_gb, ctx=None, row_bytes=None) -> float:
     """About the GB of RAM a size wants on that card: the experts the card does not hold, in the OS file cache,
     and room for the rest.  An estimate from one machine (32 GB of VRAM, 120 GB of RAM)."""
-    return d["arena_gb"] - poly_held_gb(d, vram_gb) + POLY_RAM_BESIDE_GB
+    return d["arena_gb"] - poly_held_gb(d, vram_gb, ctx, row_bytes) + POLY_RAM_BESIDE_GB
 
 
-def poly_fits(d, ram, vram_gb, hip) -> bool:
+def poly_fits(d, ram, vram_gb, hip, ctx=None, row_bytes=None) -> bool:
     """Whether a size of strata-poly's models runs on this PC with its experts in RAM, by setup's estimate."""
-    return not hip and vram_gb >= poly_beside_gb(d) + 2 and ram >= poly_ram_need(d, vram_gb) - 4
+    return (not hip and vram_gb >= poly_beside_gb(d, ctx, row_bytes) + 2
+            and ram >= poly_ram_need(d, vram_gb, ctx, row_bytes) - 4)
 
 
-def poly_verdict(d, ram, vram_gb, hip, windows=False) -> str:
+def poly_too_small(d, vram_gb, ctx=None, row_bytes=None) -> bool:
+    """Whether this card is under what a size takes before any expert: the estimate that says no install here can
+    work.  Everything a small card is offered after this is new behaviour; an install that worked is untouched."""
+    return vram_gb < poly_beside_gb(d, ctx, row_bytes) + 2
+
+
+def poly_check_ctx(fd, vram_gb) -> int | None:
+    """The context --check judges a family's sizes at: a card that no size of it fits by the 32K figure they were
+    measured with is judged at the shortest context setup offers, whose smaller KV cache is what it is short of.
+    None (the 32K figures) for every other card."""
+    sizes = fd.get("models", {})
+    return POLY_CONTEXTS[0] if sizes and all(poly_too_small(d, vram_gb) for d in sizes.values()) else None
+
+
+def poly_verdict(d, ram, vram_gb, hip, windows=False, ctx=None, row_bytes=None) -> str:
     """--check's line for a size of strata-poly's models.  `windows`: its family has run there (FAMILIES)."""
     if hip:
         return "does not run on AMD cards (its engine is a CUDA program)"
-    if vram_gb < poly_beside_gb(d) + 2:
-        return f"does not fit: it takes about {poly_beside_gb(d)} GB of VRAM before any expert"
-    need = poly_ram_need(d, vram_gb)
+    beside = poly_beside_gb(d, ctx, row_bytes)
+    if vram_gb < beside + 2:                      # beside is the weights and caches; 2 GB is the room it keeps
+        at = f" at {ctx // 1024}K tokens" if ctx else ""
+        return (f"does not fit: it needs about {beside + 2:.1f} GB of VRAM{at} for its weights and caches "
+                f"({beside:.1f} GB) and the room the engine keeps free")
+    need = poly_ram_need(d, vram_gb, ctx, row_bytes)
     return "EXPERIMENTAL, " + ("not tried on Windows, " if WIN and not windows else "") + (
-        f"fits by setup's estimate (~{need:.0f} GB of RAM on this card)" if poly_fits(d, ram, vram_gb, hip) else
+        f"fits by setup's estimate (~{need:.0f} GB of RAM on this card)"
+        if poly_fits(d, ram, vram_gb, hip, ctx, row_bytes) else
         f"wants ~{need:.0f} GB of RAM on this card: with {ram:.0f} its experts are read from the SSD")
 
 
@@ -5238,6 +5271,49 @@ def poly_tail_skip(cfg: dict, cfg_path: Path | None = None) -> None:
         write_config(cfg_path, cfg)
 
 
+def ask_poly_context(fam, a, gpu=None, small=False) -> int:
+    """The context of a size of strata-poly's models: the one --context named, or the one picked of POLY_CONTEXTS.
+    A card that no size fits by the 32K figure asks this first (poly_setup): the KV cache grows with the context,
+    so it is what decides whether the dense weights fit at all, and the size below is chosen against it."""
+    title = fam["title"]
+    if a.context:
+        if not 16 <= a.context <= 1048576:
+            fail(f"--context {a.context}: {title} takes 16 to 1048576 tokens")
+        return a.context
+    say()
+    say("  Context length = how much text the model can see at once (your chat, files, tool output).")
+    say("  Longer takes VRAM from the expert cache:")
+    row = fam.get("row_bytes", GLM_ROW_BYTES)
+    # writing after a prompt that fills the context, tokens/s, on the 8 GB laptop (docs/BACKENDS.md)
+    laptop = {32768: "52-58", 65536: "42-46", 131072: "28-30"} if fam.get("ran_on_gb") == 8 else {}
+    for i, c in enumerate(POLY_CONTEXTS, 1):
+        on8 = f"; 8 GB card: {laptop[c]} tokens/s after a full prompt" if c in laptop else ""
+        note = f"   (recommended{on8})" if c == POLY_BESIDE_CTX else \
+            f"   ({(c - POLY_BESIDE_CTX) * row / 1e9:.1f} GB more VRAM{on8 or '; no long prompt run'})" if c > POLY_BESIDE_CTX else ""
+        say(f"  {i}) {c // 1024}K tokens{note}")
+    if small:
+        say(f"  {gpu_name(gpu)} has less VRAM than those figures were measured with, and the cache of experts is what")
+        say("  it has left: a shorter context is what makes room for the model. 8K is what setup takes here.")
+    return POLY_CONTEXTS[int(ask("Context?", [str(i) for i in range(1, len(POLY_CONTEXTS) + 1)],
+                                "1" if small else str(POLY_CONTEXTS.index(POLY_BESIDE_CTX) + 1),
+                                "1" if small else a.yes)) - 1]
+
+
+def gguf_dir_picks(given: Path, want: list[Path]) -> tuple[list[Path], Path] | None:
+    """What --gguf-dir names: the file itself, or the folder's shards under the names setup expects.  A folder
+    holding one GGUF of another name - a fine-tune, another quantizer - gives that one, so nobody has to rename a
+    file their other tools already know (docs/FAQ.md).  None when there is none, or when there are several and none
+    by name: which of several is the model is not setup's to guess.  A split GGUF needs its numbered names."""
+    if given.is_file():
+        return [given], given.parent
+    if all(w.exists() for w in want):
+        return want, given
+    if not given.is_dir():
+        return None
+    there = sorted(given.glob("*.gguf"))
+    return (there, given) if len(want) == 1 and len(there) == 1 else None
+
+
 def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, adopted) -> int:
     """Steps 2 to 7 for a model of strata-poly (docs/GLM.md, docs/BACKENDS.md): its questions, the Python
     packages, the engine (ready-made or compiled here), the model file, its tokenizer and expert profile, the run
@@ -5275,13 +5351,19 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
     if a.model and a.model not in names:
         fail(f"{title} has no {a.model} model file", "choose one of: " + ", ".join(names))
     vram = gpu["vram_gb"]
-    model = a.model or poly_default(sizes, ram, vram)
+    # A size's VRAM figure was measured at 32K. A card that no size fits by it asks its context first: the KV cache
+    # is what its VRAM is short of, so the sizes below are chosen against the context that install will use. A card
+    # that fits stays on the 32K figures, in the order it was asked in before.
+    small = all(poly_too_small(x, vram) for x in sizes.values())
+    ctx = a.context or ask_poly_context(fam, a, gpu, True) if small else None
+    at = (ctx, fam.get("row_bytes", GLM_ROW_BYTES)) if ctx else (None, None)
+    model = a.model or poly_default(sizes, ram, vram, *at)
     if not a.model and len(names) > 1:
         say()
         say("  Which size?  The RAM is setup's estimate for this card: the experts it does not hold stay in RAM.")
         for i, m in enumerate(names, 1):
             say(f"  {i}) {m:14s} {sizes[m]['about']}; download {sizes[m]['download_gb']:.0f} GB, "
-                f"~{poly_ram_need(sizes[m], vram):.0f} GB of RAM")
+                f"~{poly_ram_need(sizes[m], vram, *at):.0f} GB of RAM")
         model = names[int(ask("Size?", [str(i) for i in range(1, len(names) + 1)], str(names.index(model) + 1),
                               a.yes)) - 1]
     d = sizes[model]
@@ -5303,15 +5385,15 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
             vision = auto if ask("Do you want images?", ["y", "n"], "n", a.yes) == "y" else "none"
         ok("images: " + {"none": "off", "gpu": "on", "cpu": "on (encoder on the CPU)"}[vision])
     room = max(0.0, vram - (fam["vision_vram_gb"] if vision == "gpu" else 0))   # the VRAM left for the model
-    beside = poly_beside_gb(d)
-    held, need_ram = poly_held_gb(d, room), poly_ram_need(d, room)
+    beside = poly_beside_gb(d, *at)
+    held, need_ram = poly_held_gb(d, room, *at), poly_ram_need(d, room, *at)
     say()
     say(f"  {model}: {d['about']}; download {d['download_gb']:.0f} GB. The file is read in place: about {held:.0f} of")
     say(f"  its {d['arena_gb']:.0f} GB of experts fit this card, the rest stay in RAM (the OS file cache).")
     if room < beside + 2:
         enc = vision == "gpu"                          # the encoder's share may be what does not fit
         confirm_risk(f"{title} takes about {beside} GB of VRAM before any expert (measured on a 32 GB "
-                     f"card at a 32K context)" + (f" and its image encoder {fam['vision_vram_gb']} GB" if enc else "") +
+                     f"card at a {POLY_BESIDE_CTX // 1024}K context)" + (f" and its image encoder {fam['vision_vram_gb']} GB" if enc else "") +
                      f"; {gpu_name(gpu)} has less than it takes to start", bool(a.model), a.yes,
                      f"{title} needs more VRAM than {vram:.0f} GB",
                      ("--vision cpu keeps the image encoder off the card; " if enc else "") +
@@ -5321,7 +5403,7 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
         ran = fam.get("ran_on_gb", 32)                 # a card of 8 GB reports 8,188 MiB
         warn((f"{title} has run on no card under {ran} GB. " if round(vram) < ran else "") +
              f"On {vram:.0f} GB about {100 * held / d['arena_gb']:.0f}% of {title}'s experts fit in VRAM "
-             f"({100 * poly_held_gb(d, 31.84) / d['arena_gb']:.0f}% on a 32 GB card): more of every answer is "
+             f"({100 * poly_held_gb(d, 31.84, *at) / d['arena_gb']:.0f}% on a 32 GB card): more of every answer is "
              "computed on the CPU, so it is slower")
     if ram < need_ram - 4:
         confirm_risk(f"RAM: {ram:.0f} GB. {title} wants about {need_ram:.0f} GB on this card by setup's estimate: the "
@@ -5334,24 +5416,8 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
     ok(f"size: {model}")
     tag = fam["tag"] + model                           # names of the config, the start script and the data folders
 
-    if a.context:
-        ctx = a.context
-        if not 16 <= ctx <= 1048576:
-            fail(f"--context {ctx}: {title} takes 16 to 1048576 tokens")
-    else:
-        say()
-        say("  Context length = how much text the model can see at once (your chat, files, tool output).")
-        say("  Longer takes VRAM from the expert cache:")
-        row = fam.get("row_bytes", GLM_ROW_BYTES)
-        # writing after a prompt that fills the context, tokens/s, on the 8 GB laptop (docs/BACKENDS.md)
-        laptop = {32768: "52-58", 65536: "42-46", 131072: "28-30"} if fam.get("ran_on_gb") == 8 else {}
-        for i, c in enumerate(POLY_CONTEXTS, 1):
-            on8 = f"; 8 GB card: {laptop[c]} tokens/s after a full prompt" if c in laptop else ""
-            note = f"   (recommended{on8})" if c == 32768 else \
-                f"   ({(c - 32768) * row / 1e9:.1f} GB more VRAM{on8 or '; no long prompt run'})" if c > 32768 else ""
-            say(f"  {i}) {c // 1024}K tokens{note}")
-        ctx = POLY_CONTEXTS[int(ask("Context?", [str(i) for i in range(1, len(POLY_CONTEXTS) + 1)],
-                                   str(POLY_CONTEXTS.index(32768) + 1), a.yes)) - 1]
+    if ctx is None:                                   # a small card asked above, before the size it fits with
+        ctx = ask_poly_context(fam, a, gpu)
     ok(f"context: {ctx} tokens")
 
     # the conversation cache: asked once, then kept as the model's run config has it
@@ -5368,12 +5434,21 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
     ok("conversation cache: " + (f"up to {conv} MiB of RAM" if conv else "off (the last conversation is kept)"))
 
     # one file, or the numbered files of a split GGUF: the engine is given the first and finds the others by name
-    models_dir = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / tag
-    shards = [models_dir / model_file(fam, model, i) for i in range(1, model_shards(fam, model) + 1)]
-    absent = [s.name for s in shards if not s.exists()]
-    if a.gguf_dir and absent:
-        fail(f"{models_dir} has no {absent[0]}",
-             "put the file there under that name, or leave out --gguf-dir and setup downloads it")
+    models_dir = Path(a.models_dir) / tag
+    if a.gguf_dir:
+        given = Path(a.gguf_dir)
+        want = [given / model_file(fam, model, i) for i in range(1, model_shards(fam, model) + 1)]
+        picked = gguf_dir_picks(given, want)
+        if picked is None:
+            there = sorted(p.name for p in given.glob("*.gguf")) if given.is_dir() else []
+            fail(f"{given} has no {want[0].name}" + (f", and holds {', '.join(there)}" if there else ""),
+                 "point --gguf-dir at the file itself or at a folder holding only that one; "
+                 "or leave --gguf-dir out and setup downloads the file it knows")
+        shards, models_dir = picked
+        if shards[0].name != want[0].name:
+            say(f"  using {shards[0].name}, the GGUF it holds, not the {want[0].name} of this size")
+    else:
+        shards = [models_dir / model_file(fam, model, i) for i in range(1, model_shards(fam, model) + 1)]
     if not a.gguf_dir and not all(s.exists() and done(s) for s in shards):
         for r in elsewhere:                            # already downloaded in a PolyStrata folder on another drive
             cand = [r / "models" / tag / s.name for s in shards]
@@ -5430,17 +5505,27 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
                 continue
             download(d.get("hf", fam["hf"]) + s.name, s)
     check_shards(shards)
+    # A file --gguf-dir named is the user's own: setup has no pinned SHA-256 for it, and must not delete it over
+    # one (verify_sha256 unlinks a file whose hash differs).  What setup downloaded itself is checked as before,
+    # which is what the Qwen engine's path does and what docs/FAQ.md tells people to expect here.
+    def own(p):
+        return a.gguf_dir and p.parent == models_dir
     for s in shards:
-        verify_sha256(s, *fam["sha256"][s.name])
+        if own(s):
+            say("  --gguf-dir: not one of setup's pinned files, so its SHA-256 is not checked")
+        else:
+            verify_sha256(s, *fam["sha256"][s.name])
     if guesser is not None:
         if not have_guesser:
             say("  Its draft model lets it guess a few words ahead and check them at once (faster answers).")
             download(d.get("hf", fam["hf"]) + d["draft_model"], guesser)
-        verify_sha256(guesser, *fam["sha256"][guesser.name])
+        if not own(guesser):
+            verify_sha256(guesser, *fam["sha256"][guesser.name])
     if mmproj is not None:
         if not have_mmproj:
             download(fam["mmproj_hf"] + fam["mmproj"], mmproj, "vision encoder")
-        verify_sha256(mmproj, *fam["sha256"][mmproj.name])
+        if not own(mmproj):
+            verify_sha256(mmproj, *fam["sha256"][mmproj.name])
         ok(f"vision encoder: {mmproj}")
     ok("model file present")
 
@@ -5481,8 +5566,12 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
         args += ["--vram-reserve-mib", str(a.vram_reserve_mib)]
         ok(f"VRAM kept free for other programs: {a.vram_reserve_mib} MiB (--vram-reserve-mib; the expert cache takes "
            "that much less)")
-    if fam.get("tail_skip"):
-        args += ["--tail-skip", str(fam["tail_skip"])]
+    if fam.get("tail_skip") or a.tail_skip is not None:
+        tail = a.tail_skip if a.tail_skip is not None else fam["tail_skip"]
+        if tail > 0:
+            args += ["--tail-skip", str(tail)]
+            ok(f"--tail-skip {tail}: experts outside VRAM that no token ranks in its first {tail} are not computed "
+               "(less for the CPU on a small card; the answers move a little)")
     # The engine's own count is every logical CPU.  On a hybrid CPU that is the slowest: an efficiency core runs
     # an expert at half the speed, and a layer waits for its slowest part (hybrid_pool_workers()).
     cores = cpu_cores()
@@ -5652,6 +5741,11 @@ def main() -> int:
     ap.add_argument("--vram-reserve-mib", type=int, metavar="N",
                     help="VRAM in MiB the engine leaves free for other programs (a game, another model; the engine's "
                          "default: 700); the expert cache takes that much less")
+    ap.add_argument("--tail-skip", type=int, metavar="N",
+                    help="a strata-poly engine (Qwen3.6, Ornith 1.5, Gemma 4): do not compute an expert outside VRAM "
+                         "that no token of the call ranks in its first N (0 turns it off). It leaves the CPU less "
+                         "to do on a small card and moves the answers a little; Qwen3.6 takes 6 by default, the "
+                         "others have no measured value here")
     ap.add_argument("--parallel", type=int, metavar="N",
                     help="up to N requests decode together (batch slots, opt-in; default: one at a time, the others "
                          "wait). Each slot takes VRAM from the expert cache; setup says what it recommends")
@@ -5943,9 +6037,13 @@ def main() -> int:
             any_fits = any_fits or not verdict.startswith("does not fit")
             say(f"  {m:8s} needs ~{d['ram_gb']} GB RAM: {verdict}")
         for f, fd in FAMILIES.items():                  # the families with sizes of their own
+            c = poly_check_ctx(fd, gpu["vram_gb"])
+            if c and a.context:
+                c = a.context                             # a small card, judged by the context that was asked for
+            at = (c, fd.get("row_bytes", GLM_ROW_BYTES)) if c else (None, None)
             for m, d in fd.get("models", {}).items():
-                any_fits = any_fits or poly_fits(d, ram, gpu["vram_gb"], hip)
-                say(f"  {fd['title']} {m}: {poly_verdict(d, ram, gpu['vram_gb'], hip, bool(fd.get('windows')))}")
+                any_fits = any_fits or poly_fits(d, ram, gpu["vram_gb"], hip, *at)
+                say(f"  {fd['title']} {m}: {poly_verdict(d, ram, gpu['vram_gb'], hip, bool(fd.get('windows')), *at)}")
         if not any_fits:
             # #977: every size says "does not fit", so the verdict says so too (and the exit code, for scripts). It only
             # reports: --model NAME --yes still installs one anyway.
@@ -5974,6 +6072,9 @@ def main() -> int:
         say(f"  Its license: {fam['license']}")
     if fam.get("engine") == "poly":                     # another engine: its own questions and steps
         return poly_setup(a, family, gpu, hip, cuda_tk, bool(multi), ram, data, elsewhere, port, adopted)
+    if a.tail_skip is not None:                       # the Qwen engine reads this from its environment, not a flag
+        warn(f"--tail-skip {a.tail_skip} is a strata-poly setting; {title} takes it as STRATA_ROUTE_TAIL_SKIP="
+             f"{a.tail_skip} in the run config's env (it defaults to 7 on CUDA), so the flag is not used here")
     say()
     names = [m for m in MODELS if family in MODELS[m].get("families", ("qwen", "swift"))]
     names.sort(key=lambda m: bool(MODELS[m].get("experimental")))   # an experimental size last, never the default

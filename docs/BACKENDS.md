@@ -750,6 +750,74 @@ A short chat is written at about the same speed with every context, 60 to 66 tok
 lends from the RAM, and a prompt of 236K tokens had not been read after 20 minutes. Only this 8 GB card was
 measured; a larger card keeps more experts at every context.
 
+### A card with 6 GB of VRAM
+
+Below 8 GB a size's VRAM figure does not hold: the weights and the caches of every one of them are more than the
+card has. Setup says so instead of guessing, and then makes the two choices such a card has. It asks the context
+first, because the KV cache is what it is short of: at 8,192 tokens Gemma 4's is 0.66 GB smaller than at 32K,
+enough that its smallest size fits. It then takes the size that puts the most experts in the VRAM that is left,
+UD-Q2_K_XL, rather than the one that wants the least RAM, which on a card with RAM to spare is the largest file
+and leaves the card least. `--check` judges such a card at the shortest context and reports the size that fits. A
+card that fits a size at 32K is not touched: Ornith's APEX-I-MINI fits 6 GB at 32K and keeps the RAM rule.
+
+Measured on one such card: a **GTX 1660 SUPER with 6,144 MiB** (compute capability 7.5), driver 580.97, an **AMD
+Ryzen 5 3600** (6 cores, 12 threads, AVX2 and no AVX-512), 31.9 GB of RAM, Windows 10 build 19044. The
+ready-made engine, which the release builds for sm_75 among others, so nothing was compiled; NVIDIA's CUDA 13.0
+runtime from pip. `gemma-4-26B-A4B-it-UD-Q2_K_XL.gguf` (10.55 GB) with Google's draft model
+`mtp-gemma-4-26B-A4B-it-Q8_0.gguf`, a context of 16,384, no images, no conversation cache, no `--tail-skip`.
+`polystrata.py benchmark --model gemma-4-26b-a4b-ud-q2_k_xl`, 256 tokens of answer, two runs.
+
+The engine loaded in 2.1 s with **533 of 3,840 routed experts in VRAM (1.1 GiB)** and 12 CPU threads, and held
+5.27 to 5.29 GiB of the card's 6 GiB while it answered. The machine's RAM peaked at 20.1 GiB of its 31.9 on a short
+prompt and 21.1 GiB on a 10,982-token one.
+
+| Prompt, tokens | First token, s | Reads, tokens/s | Writes, tokens/s | Experts from VRAM | Guesses right |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 26 | 0.93 to 0.96 | 30.0 to 32.9 | 37.9 to 39.2 | 44% to 58% | 69% to 72% |
+| 2,838 | 17.4 to 17.6 | 162.5 to 163.7 | 35.0 to 37.2 | 42% to 44% | 74% to 76% |
+| 10,982 | 61.7 to 62.1 | 144.1 to 145.0 | 35.7 to 36.7 | 50% | 78% to 81% |
+
+Every one of those six runs spent all 256 tokens of its budget **thinking and answered nothing**: Gemma 4 at
+effort `high` writes 1,400 to 1,800 characters of reasoning before it starts, so the benchmark's 256-token cap is
+below its thinking. The writes above are therefore the speed of generation, not of a completed answer. They
+match the answers the same engine wrote when given room (38.7 to 42.0 tokens/s over 454 and 1,120-token replies,
+`finish: stop`), so nothing is lost by the cap - but a figure from this table is not a figure for a reply that
+ended. `reasoning_budget_tokens` is what leaves room to answer.
+
+Writing costs the same after 26, 2,838 and 10,982 prompt tokens, and the card's VRAM does not grow with the
+prompt: the engine takes the context's VRAM as the conversation grows, not at load. The draft model carries
+about a third of the writing - 154 of 194 of the guesses it offered were taken on the 2,838-token prompt - and
+that is more of the speed than the experts in VRAM are: 533 of 3,840 is 14% of them, with the card's GPU at
+50% to 97% and the CPU doing the rest. The longest prompt left the GPU nearly busy (97%) and the CPU at 19%.
+
+The context was 8,192 first and is 16,384 now. Doubling it cost nothing measurable: 532 experts in VRAM against
+533, the same 5.3 GiB on the card, and writes within the spread of two runs at 8,192 (35.0 to 39.2 against 37.5
+to 41.2, overlapping). RAM rose about 0.7 GiB at the longest prompt. What 16,384 buys is the last row: the
+10,982-token prompt does not fit an 8,192 context, where the benchmark skips it. Setup says this size does not
+fit a 6 GB card at 16,384 (it needs about 6.16 GB by its own estimate) and asks to go on; it loaded without
+trouble, because the engine sizes the expert cache for the context as it grows and not for the maximum.
+
+Above 32,768 the estimate rises again, because a size's VRAM figure was measured at a 32K context and its KV
+cache is `row_bytes` a token. By 32,768 this card's cache holds about 0.88 GiB, and at 65,536 about 1.75 GiB -
+more than the 1.1 GiB of experts measured above at 16,384. **Those are the measured 16,384 numbers carried
+forward by arithmetic, not a measurement at those contexts**: what a 32K conversation really leaves for the
+experts here was not run, and the answer would be slower than the table above. A context of 80,000 or more does
+not fit - the KV cache alone would ask for more than this card has beside the model's weights, and setup's
+estimate leaves under 2% of the experts. Setup reports the figure for the context it is given rather than the
+32K one.
+
+Setup's estimate for this card was **about 25% of the experts and 2.2 GB** at 8,192 tokens, where the engine
+actually put 14% and 1.1 GiB. The estimate is nearly twice what the card had for it. It is the one figure on this
+page not measured on the machine it describes: it is a size's `vram_beside_gb`, measured on an RTX 5090 at 32K,
+less the KV cache at the context asked. What a small card spends beyond the weights and the caches - here the
+desktop it drives, the driver's own use and the engine's reserve - is in no figure setup has. Expect fewer experts
+than setup says on a card under 8 GB.
+
+Not measured on this card: Qwen3.6 and Ornith 1.5, the other two families that fit it at 8K by setup's estimate;
+any context above 16,384; images; a prompt longer than 10,982 tokens; a second run after a reboot (cold file
+cache); `--tail-skip` at any value, which is the obvious next thing to try on a card where 86% of the experts are
+on the CPU; and a 6 GB card that does not drive a desktop. One card, one model, one size, four runs.
+
 ## How each backend was checked
 
 Against llama.cpp on the same file: greedy, 64 tokens after five chat prompts of about 25 to 8000 tokens, the
