@@ -225,6 +225,7 @@ void Gemma4::load_layer(int il) {
     load_moe(il, false);
     B.escale.assign((size_t) n_expert_, 1.f);
     if (const TensorInfo* s = tensor(il, "ffn_down_exps.scale")) {
+        B.escale_dev = upload(s, blk(il, "ffn_down_exps.scale"), n_expert_, 1, kF32);
         if (s->type != kTypeF32 || (int64_t) s->elements() != n_expert_ ||
             home(*s).payload(*s) != (size_t) n_expert_ * sizeof(float))
             throw std::runtime_error(s->name + " is " + shape_of(*s) + ", expected F32 [" +
@@ -248,7 +249,9 @@ void Gemma4::alloc_caches() {
     for (const Block& B : blocks_)
         if (B.swa) rings += 2 * (size_t) ring_ * B.n_kv * B.dim;
     uint16_t* kv = rings ? (uint16_t*) dmalloc(rings * sizeof(uint16_t), "the attention cache") : nullptr;
-    for (Block& B : blocks_) {
+    for (int il = 0; il < (int) blocks_.size(); ++il) {
+        Block& B = blocks_[(size_t) il];
+        if (!runs(il)) continue;
         const size_t row = (size_t) B.n_kv * B.dim;
         if (B.swa) {
             B.keys = kv;
@@ -288,14 +291,14 @@ void Gemma4::assign_scratch() {
 }
 
 // A sequence's rows are the full layers': a window layer's are part of its state (save_layer()).
-size_t Gemma4::row_bytes() const {
+size_t Gemma4::card_row_bytes() const {
     size_t b = 0;
     for (const Block& B : blocks_)
         if (!B.swa) b += 2 * (size_t) B.n_kv * B.dim * sizeof(uint16_t);
     return b;
 }
 
-void Gemma4::save_rows(int64_t first, int64_t n, uint8_t* dst) {
+void Gemma4::save_card_rows(int64_t first, int64_t n, uint8_t* dst) {
     if (first < 0 || n < 0 || first + n > opt_.max_context)
         throw std::logic_error("save_rows: the rows are outside the context");
     ck(cudaStreamSynchronize(cs(st_)), "save rows");
@@ -310,7 +313,7 @@ void Gemma4::save_rows(int64_t first, int64_t n, uint8_t* dst) {
     }
 }
 
-void Gemma4::load_rows(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n) {
+void Gemma4::load_card_rows(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n) {
     if (from < 0 || first < from || n < 0 || first + n > from + count || first + n > opt_.max_context)
         throw std::logic_error("load_rows: the rows are outside what was saved");
     cover(first + n);
@@ -474,7 +477,7 @@ void Gemma4::layer_head(Layer& L, int il, int n) {
     rms_norm(r_, fp(B.pre_moe), xn_, n_embd_, n, rms_eps_, st_);
     kernels::native_quantize_q8_1(xn_, xq_, all, 1, st_);
     dbg("ffn_in", il, xn_, n_embd_);
-    if (!(mmq_ && n >= kStageRows)) moe_router(L, n);
+    if (!batched(L, n)) moe_router(L, n);
 }
 
 // The router reads the residual, normed and scaled a value at a time (rin_).
@@ -571,9 +574,16 @@ void Gemma4::draft_step(int32_t token, int i) {
 
 float Gemma4::embed_scale() const { return std::sqrt((float) n_embd_); }
 
+bool Gemma4::route_card(int il, int n, int32_t* ids, float* w) {
+    const Block& B = blocks_[(size_t) il];
+    route_rows(rl_, n_expert_, n_used_, n, 0, 1.f / std::sqrt((float) n_embd_), nullptr, fp(B.escale_dev), true, 0.f,
+               ids, w, st_);
+    return true;
+}
+
 // What ggml's MoE graph does for this model: the router's scores over the root of the width, a softmax over every
 // expert, the n_used most likely with their weights made to sum to one, and each expert's own scale on its output.
-void Gemma4::route(int il, const float* logits, int* ids, float* w, float* probs) const {
+void Gemma4::route(int il, const float* logits, int32_t, int* ids, float* w, float* probs) const {
     const std::vector<float>& escale = blocks_[(size_t) il].escale;
     const float s = 1.f / std::sqrt((float) n_embd_);
     float mx = logits[0] * s;

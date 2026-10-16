@@ -3,6 +3,7 @@
 Share measurements from your own hardware so other users can judge how Strata
 might run on a similar machine. This guide suggests a report format and a pull
 request workflow; a single model, GPU, or context length is enough to contribute.
+The quickest way is the built-in benchmark: [`BENCH.bat` / `./bench.sh`](#run-the-benchmark) writes a report in this format.
 
 Existing [benchmark reports](../bench/results/) provide examples. The
 [engine 0.1.26 speed report](../bench/results/2026-09-29-speed-0126/README.md)
@@ -22,8 +23,11 @@ leaves out.
 | [u/Present_Resource4022](https://www.reddit.com/r/LocalLLM/s/skrEbN9f48) | RTX 4070 SUPER 12 GB | CPU not stated; 32 GB DDR5-6000; Windows 11 | Qwen3.6-35B-A3B, HauhauCS uncensored Aggressive TTQ Q4_K_M | about 8K / about 32K | on | 140 / 100 | 2,800 to 3,300 | llama.cpp at 8K: about 77 writing and 2,600 reading, settings not stated |
 | [u/hope_it_helps](https://www.reddit.com/r/LocalLLM/comments/1x22inc/comment/pf1lr00/) | RTX 4070 Ti 12 GB | not stated | Ornith 1.5 APEX-I-Compact | not stated | not stated | about 90, 60 at the slowest | not stated | usually 40 before, engine not stated |
 | [u/Sensitive_Song4219](https://www.reddit.com/r/LocalLLM/comments/1x22inc/comment/pf3r111/) | RTX 5060 Laptop 8 GB | Core Ultra 9 275HX; 32 GB DDR5; system not stated | Tiel Coder 35B-A3B, file not stated | not stated | not stated | maybe 20% faster than before, no figure | 1,000 to 1,500; 1,016 at the slowest on a large read, over 1,400 in an auto-compact | 200 to 350 reading before, engine not stated |
+| [iMilnb](https://github.com/VecSzn/PolyStrata/issues/13) | RX 7600 8 GB (gfx1102), the AMD beta | Ryzen 5 5600X; 30 GB; Linux, ROCm from AMD's wheels | Qwen3.6-35B-A3B UD-Q2_K_XL, and Ornith 1.5 APEX-I-Mini | 32K; the 24,000-token prompt is 31,834 tokens; `--kv-whole` | on | Qwen3.6: 74 in a short chat, 53 after the long prompt; Ornith: 40 and 43 | Qwen3.6 481, Ornith 444 | the first run of this engine on an AMD card, through the author's own port (#11) |
+| [biurquezjoselina-design](https://github.com/VecSzn/PolyStrata/issues/10) | RTX 5090 D v2 24 GB | Core i7-14700KF, 13 threads; 128 GB DDR5; Windows 10 | GLM 5.3 Flash 3.0BIT (neuralll), 113.6 GB, with the draft block; 1,483 experts in VRAM | 32K, and 256K to 1M set in the run config | on | 26 to 30 after a short prompt, 23 to 30 after 2.5K to 10K | 213 to 395 at 2.5K to 10K; 488 at 112K down to 286 at 557K in one request each, every planted fact found; with 0.1.44.1-poly.5, 1,002,452 tokens in one request in 45.7 min (366 tok/s; 66.3 min with poly.2), the three facts found, and 17.7 tok/s writing after it | the first run of GLM on Windows; this project's 32 GB Linux pod reads 29K at 740 to 820 |
+| [biurquezjoselina-design](https://github.com/VecSzn/PolyStrata/issues/21) | RTX 5090 D v2 24 GB | Core i7-14700KF, 13 threads; 128 GB DDR5; Windows 10 | DeepSeek V4 Flash UD-IQ2_XXS (Unsloth), 90.9 GB, on the release's ready-made engine | 32K, and 256K to 1M set in the run config | no MTP; guesses from repeated text | 35 to 36 after a short prompt, 29 to 34 after 2.5K to 10K | 303 to 469 at 2.5K, 688 to 805 at 10K; 393 at 252K, 247 at 504K and 138 at 1,008K in one request each, every planted fact found | the first run of DeepSeek V4 Flash on Windows; this project's 32 GB Linux pod read 487,529 tokens in 1,923 s |
 
-The HauhauCS file and Tiel Coder are not among the files setup offers. How to give setup such a file is in the
+Setup offers Tiel Coder now (`--family tiel`), and not the HauhauCS file. How to give setup such a file is in the
 [FAQ](FAQ.md#can-i-run-a-fine-tune-or-another-model-with-the-same-architecture).
 
 To add yours, open an issue at [VecSzn/PolyStrata](https://github.com/VecSzn/PolyStrata/issues) with what
@@ -79,7 +83,13 @@ engine, is in `<run folder>/raw/`, and the engines' logs are in the run folder.
 `--fit on` lets llama.cpp decide how many layers' experts go to the processor. A number picked by hand with
 `-ngl 99 --n-cpu-moe N` can be faster; on the README's 8 GB laptop it was N = 30 for Qwen3.6 UD-Q3_K_M. The
 context of 36,864 on both sides leaves room for the 32K prompt and its answer, and `-fa on` with the q8_0 cache is
-how Strata's comparison ran llama.cpp. The example is for Qwen3.6 UD-Q3_K_M, the size this was run with here.
+how Strata's comparison ran llama.cpp. The example is for Qwen3.6 UD-Q3_K_M.
+
+The README's laptop ran it on 2026-10-11 with the engine of 2ba29a383baf and llama.cpp b11540, for
+[Qwen3.6 UD-Q3_K_M](../bench/results/2026-10-11-laptop-qwen36-llamacpp-b11540/README.md) and
+[Tiel Coder UD-Q3_K_XL](../bench/results/2026-10-11-laptop-tiel-llamacpp-b11540/README.md). Against llama.cpp's
+fastest setting in each cell, PolyStrata read the prompts 2.7 to 3.5 times as fast and wrote 1.5 to 1.8 times as
+fast.
 
 ## Community reports
 
@@ -123,6 +133,9 @@ how Strata's comparison ran llama.cpp. The example is for Qwen3.6 UD-Q3_K_M, the
   Strata 0.1.40.3 prebuilt Windows HIP engine, Flash-Next IQ2_XS and IQ3_XXS: a prefill-size sweep (8,192 best), a matched 32K coding comparison (9/9 tasks each, IQ2_XS about 17% faster decode), one 113K recall request. Sanitized data, fixtures and scripts included.
 - [2026-10-10: 2x Tesla P40 24 GB, Xeon E5-2699 v3, 125 GB RAM](../bench/results/2026-10-10-community-2x-p40-iq3_s/README.md):
   Strata 0.1.41 CUDA 12 source build (sm_61), Flash-Next IQ3_S, 131,072-token context, layer split; decode 35.0 tok/s, prompt 350/558 tok/s at 3.9K/21.9K, needles 6/6, conversation checkpoints.
+- [2026-10-12: Tesla P40 24 GB (sm_61), 20 vCPUs of a Xeon E5-2695 v4 without AVX-512, 98 GB RAM](../bench/results/2026-10-12-p40-sm61-kernels/README.md):
+  Strata `a0116b2` (0.1.43.1) CUDA 12.4 source build, Flash-Next IQ3_S, 262,144-token context, the profile of a prompt and of a decode window on Pascal and four bitwise changes for sm_61:
+  a 565-token prompt 205 -> 255 tok/s, decode 34-35 -> 37-38 tok/s, and with the opt-in `STRATA_DENSE_F32=1` a 7K prompt 360-432 -> 464-474 tok/s. Short and 7K prompts only; cuBLAS 12.4 only.
 - [2026-10-09: RTX 5060 Ti 16 GB + Xeon E5-2680 v4 (Windows 10)](../bench/results/2026-10-09-community-rtx-5060-ti-e5-2680-v4/README.md):
   Strata 0.1.41, Coder IQ1_M and abliterated Q2_0 at 262K; prompt and decode at 4K / 32K / 128K.
 - [2026-10-09: RTX 5060 Ti 16 GB under WSL2, Ryzen 7 3700X, 128 GB RAM](../bench/results/2026-10-09-community-rtx-5060ti-wsl2-iq3_s-0141/README.md):
@@ -137,6 +150,53 @@ how Strata's comparison ran llama.cpp. The example is for Qwen3.6 UD-Q3_K_M, the
   in VRAM, 21.1 GiB of RAM. Records that every benchmark run spent its answer cap thinking and answered nothing,
   where setup's own VRAM estimate ran high on this card (about 25% of the experts predicted, 14% actual) and
   pessimistic about the context.
+
+## Run the benchmark
+
+The simplest report is one command after setup. Windows: double-click `BENCH.bat`. Linux: `./bench.sh`. Or
+`python tools/strata_bench.py` from the Strata folder. Setup also offers it at the end of an interactive install
+(default no).
+
+It starts the model with the settings you already have (the newest `strata-*.json`; `--config FILE` picks another one),
+or uses a Strata server that is already running on that port (`--url http://127.0.0.1:8080` for another address). It then
+sends a fixed suite through the HTTP API, three runs each, and reports medians with ranges. The default takes about
+3 to 10 minutes once the model has loaded:
+
+| Test | What it sends | What it reports |
+| --- | --- | --- |
+| chat | three short questions, up to 100 new tokens | decode tok/s, time to first token |
+| 4K and 16K prompt | a fresh word-list prompt of about 4,096 and 16,384 tokens (skipped when your context is smaller) | prompt tok/s, time to first token |
+| agent session | a system prompt and four tools, then five turns that each add about 1,500 words of a project file and continue from the model's own earlier answers | tokens the conversation cache reused, tokens read again, time to first token per turn |
+| `--clients N` | N requests at the same moment (the server needs `--batch` to run them together) | total tok/s, p50 and p95 first-token time and latency |
+| `--long` | the prompt test at about 32,768 tokens | prompt tok/s, time to first token |
+
+Speeds are the engine's own timings (`prompt_per_second`, `predicted_per_second` in the answer); first-token time and
+latency are measured by the client. Thinking is off for the suite so the answers are short and the runs comparable
+(`--think` leaves it on). Every prompt carries a unique tag, so the fresh-prompt tests never get help from the cache.
+Close other programs first: a browser or a game changes the numbers.
+
+The result goes to `bench/results/<date>-community-<gpu>-<model>/` (or `--out DIR`):
+
+- `README.md` in the format below, with the GPU, VRAM, CPU, RAM, OS, driver, Strata and engine versions, model and
+  quantization, context and your settings filled in from the machine and the server
+- `results.json` with every request (tokens, timings, errors) and the machine facts
+- `engine-log-excerpt.txt` with the engine's start-up lines (when the benchmark started the server)
+
+Home folders, user and host names, local network addresses and API keys are replaced by placeholders before anything is
+written. Read the report once before you share it: the benchmark cannot know what else you consider private.
+
+To share it, open a pull request that adds the folder (see [Submit a report](#submit-a-report)), or paste
+`README.md` into a GitHub issue. Add what the tool does not know: background load, power limits, storage.
+
+To compare with an earlier run on the same machine (before and after an update or a setting change):
+
+```bash
+python tools/strata_bench.py --compare bench/results/2026-10-01-community-rtx-3060-qwen3-8-flash-next
+python tools/strata_bench.py --compare OLD_FOLDER --compare-only NEW_FOLDER   # two saved runs, nothing is started
+```
+
+The tool is a speed check, not a quality test. For recall and other checks, see [Optional correctness
+checks](#optional-correctness-checks); for A/B tests of two builds use `tools/ab_engine.py`.
 
 ## What to record
 

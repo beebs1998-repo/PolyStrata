@@ -216,6 +216,14 @@ of decode (one card 47.5 / 46.9 / 48.3 -> 50.5 / 48.5 / 51.3 tok/s with it on). 
 `bench/results/2026-10-04-community-rx-6800-windows`): on was 12-22% slower. 4x R9700: fork off was 13-45% faster.
 Linux RX 6000 users can try `STRATA_SH_STREAM=1`; the output is identical either way.
 
+**The draft's side stream (`STRATA_MTP_SIDE_STREAM`):** HIP does not use the MTP drafter's branch stream, and since
+0.1.40.2 it does not create it (#1240: an R9700 lost prompt speed with it). gfx103x is the exception and creates it: on
+an RX 6800 under Windows (`STRATA_HIP_PROMPT_F16=1`, IQ3_XXS, two runs each) a 7.9K-token prompt reads at 798-808 tok/s
+with the stream and 584-596 without, and a 30.4K-token one at 855-863 against 553-600; `STRATA_PREFILL_TIMING=1` puts
+the whole difference in the "wait copy" phase (3,081 -> 75 ms and 12,642 -> 288 ms). Decode and the output are the same.
+`STRATA_MTP_SIDE_STREAM=0` turns it off on gfx103x, `=1` creates it on another HIP card. Measured on one card and one
+OS; a Linux gfx103x number is welcome.
+
 **Long prompts on a big card: check the lend-coverage line (#1389, measured by the reporter on an RX 7900 XTX, gfx1100,
 v0.1.40.2, 50 GB RAM).** With `--resident-experts` the prompt path borrows cache slots, and the experts of those slots
 must also sit in RAM. After the first request of a start the engine prints
@@ -362,6 +370,44 @@ an RX 9070 XT 16 GB and a Radeon AI PRO R9700 32 GB (both gfx1201), a Ryzen 9 39
 - **Known:** rarely (about 1 start in 10) a HIP run's greedy output differs from another start's at some token, on
   one card or two and on engine 0.1.29 as well; not yet explained.
 - **Not validated:** images, long contexts beyond 16K, answer-quality benchmarks.
+
+## strata-poly on AMD (beta)
+
+The four smaller models of PolyStrata's own engine (Qwen3.6, Ornith 1.5, Gemma 4, Tiel Coder) and GLM 5.3 Flash
+run through `strata-poly`, which is CUDA-shaped code; since 0.1.42-poly.4 it compiles for an AMD card through the
+same `hip_compat` headers as the main engine, with the CUDA driver's virtual memory calls mapped onto HIP's
+(`hip_compat/cuda.h`). Linux only: there is no ready-made AMD engine, and setup refuses these models on an AMD
+card under Windows.
+
+- Install as for NVIDIA: `./setup.sh --family qwen36` (or `lfm25`, `ornith`, `gemma4`, `tiel`, `glm`, `deepseek`).
+  Setup compiles the engine for the card into `engine-poly/` (`build_engine_poly_hip`), with ROCm from a system
+  install or AMD's wheels in `.venv`, as for the main engine, and compiles again after a `git pull` that changed the
+  engine.
+- Images stay off: the image encoder is a CUDA program.
+- The attention caches take their VRAM at load on an AMD card (`--kv-whole`; setup writes it into the config and
+  adds it to an older one on update). On NVIDIA they grow with the conversation, and the expert cache gives VRAM
+  up to them as it grows; on ROCm the VRAM that `hipMemUnmap` and `hipMemRelease` give back never returns to the
+  free pool (an RX 7600 showed 48 MiB free after releasing 1 GiB, [#13](https://github.com/VecSzn/PolyStrata/issues/13)), so a long prompt was refused
+  with "no VRAM for the attention cache". With the caches whole, 32K of context fits on 8 GB beside 4,592 of
+  Qwen3.6's 10,496 experts (4.4 GiB).
+- Measured by the port's author on an RX 7600 (gfx1102, 8 GB; Ryzen 5 5600X, 30 GB of RAM) with the README's
+  benchmark, `--kv-whole` on ([#13](https://github.com/VecSzn/PolyStrata/issues/13)):
+
+  | Model | Short chat, writes | After a 32K prompt, reads / writes |
+  | --- | --- | --- |
+  | Qwen3.6-35B-A3B UD-Q2_K_XL | 74 tokens/s | 481 / 53 tokens/s |
+  | Ornith 1.5 APEX-I-Mini | 40 tokens/s | 444 / 43 tokens/s |
+
+  The first tokens after a load come slower while the expert cache fills (the port's own steady-state figures
+  were 64 and 35 tokens/s, with 5,125 and 4,517 experts in VRAM). Gemma 4, Tiel Coder and GLM have not been tried
+  on an AMD card, and setup warns so.
+- The same greedy tokens as on CUDA are not promised across backends, as above, and the card's experts and the
+  CPU's do not give the same ones on either: with every expert on the CPU (`--no-gpu-experts`) a greedy answer
+  parts from the card's after 15 to 50 tokens on the RX 7600, and after 11 to 70 on an RTX 5090 (Qwen3.6
+  UD-Q2_K_XL and UD-Q3_K_M, a 24-token and a 1.2K-token prompt, 256 tokens, mean KL of the top 40 before the
+  parting 0.0001 to 0.005; each side gives itself the same tokens in a second round). The two sum an expert's
+  products in a different order, and a near tie goes the other way. On CUDA the port changes nothing: the same
+  tokens and speed as before on an RTX 5090.
 
 ## Community-validated cards
 

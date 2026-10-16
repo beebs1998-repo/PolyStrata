@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <stdexcept>
 
 namespace strata::poly {
@@ -16,6 +17,10 @@ namespace {
 constexpr int kConv = 4;   // what conv4_silu is written for; checked at load
 constexpr float kMinWeightSum = 6.103515625e-5f;   // the floor ggml's MoE graph puts under the gate sum
 constexpr size_t kScoreFloats = size_t(16) << 20;  // the attention's scores of the tokens it takes at a time
+// A q8 prompt batch's product reads a block of keys at a time; before each block its K and V rows are dequantized
+// into an fp16 workspace of this many rows.  Bounded, so it does not grow with the context: the natural block is
+// about 16/3 * head_dim rows, well under this, so real prompts take the same products the fp16 path takes.
+constexpr size_t kQ8WorkRows = 2048;
 
 }  // namespace
 
@@ -39,6 +44,9 @@ void Qwen35::load_geometry() {
     n_head_ = shape_i("attention.head_count");
     n_kv_ = shape_i("attention.head_count_kv");
     head_dim_ = shape_i("attention.key_length");
+    if (opt_.kv_format == KvFmt::kQ8_0 && (n_kv_ * head_dim_) % 32 != 0)
+        throw std::runtime_error("--kv q8_0 needs n_kv*head_dim to be a multiple of 32 (ggml QK8_0); this model "
+                                 "has " + std::to_string(n_kv_ * head_dim_));
     const MetaValue* rot = find("rope.dimension_count");
     n_rot_ = rot ? (int) rot->u : head_dim_;
     s_dim_ = shape_i("ssm.state_size");
@@ -118,15 +126,28 @@ int Qwen35::widest() const { return std::max(d_inner_, n_head_ * head_dim_); }
 
 // The attention layers' caches, and each recurrent layer's convolution and delta-rule state in state_.
 void Qwen35::alloc_caches() {
+    if (opt_.kv_format == KvFmt::kQ8_0) {
+        const size_t row_bytes = (size_t) n_kv_ * head_dim_ + (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t);
+        std::fprintf(stderr, "strata-poly: q8_0 KV cache: %zu bytes a row\n", row_bytes);
+    }
     const size_t past_n = size_t(3) * conv_dim_, s_n = size_t(v_heads_) * s_dim_ * s_dim_;
     const size_t row = (size_t) n_kv_ * head_dim_ * sizeof(uint16_t);
     float* st = state_;
-    for (Block& B : blocks_) {
+    for (int il = 0; il < (int) blocks_.size(); ++il) {
+        Block& B = blocks_[(size_t) il];
+        if (!runs(il)) continue;
         if (B.gdn) {
             B.past = st;
             st += past_n;
             B.s = st;
             st += s_n;
+        } else if (opt_.kv_format == KvFmt::kQ8_0) {
+            const size_t codes_row = (size_t) n_kv_ * head_dim_;                            // int8
+            const size_t scales_row = (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t);  // fp16
+            B.k_codes = (int8_t*) kv_alloc(codes_row, 1);
+            B.k_scales = (uint16_t*) kv_alloc(scales_row, 1);
+            B.v_codes = (int8_t*) kv_alloc(codes_row, 1);
+            B.v_scales = (uint16_t*) kv_alloc(scales_row, 1);
         } else {
             B.keys = (uint16_t*) kv_alloc(row, 1);
             B.vals = (uint16_t*) kv_alloc(row, 1);
@@ -156,6 +177,11 @@ void Qwen35::assign_scratch() {
     score_ = fbuf((size_t) chunk_ * n_head_ * opt_.max_context);
     sg_ = fbuf(n);
     if (rows_ >= kStageRows) awork_ = fbuf(heads + heads / 2 + 1 + 3 * n * n_head_);   // a prompt batch's attention
+    if (rows_ >= kStageRows && opt_.kv_format == KvFmt::kQ8_0) {
+        // the K and V blocks a q8 prompt batch dequantizes, side by side; work_halves_ halves each
+        work_halves_ = kQ8WorkRows * (size_t) n_kv_ * head_dim_;
+        q8w_ = fbuf((2 * work_halves_ + 1) / 2);
+    }
 }
 
 // A recurrent layer's convolution and delta-rule state lie one behind the other in state_ (alloc_caches()).
@@ -168,15 +194,40 @@ void Qwen35::save_layer(int il, int64_t, uint8_t* dst) {
        "save state");
 }
 
-size_t Qwen35::row_bytes() const { return (size_t) n_attn_ * 2 * n_kv_ * head_dim_ * sizeof(uint16_t); }
+size_t Qwen35::card_row_bytes() const {
+    if (opt_.kv_format == KvFmt::kQ8_0)
+        return (size_t) n_attn_ * 2 *
+               ((size_t) n_kv_ * head_dim_ + (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t));
+    return (size_t) n_attn_ * 2 * n_kv_ * head_dim_ * sizeof(uint16_t);
+}
 
-void Qwen35::save_rows(int64_t first, int64_t n, uint8_t* dst) {
+void Qwen35::save_card_rows(int64_t first, int64_t n, uint8_t* dst) {
     if (first < 0 || n < 0 || first + n > opt_.max_context)
         throw std::logic_error("save_rows: the rows are outside the context");
     ck(cudaStreamSynchronize(cs(st_)), "save rows");
+    if (opt_.kv_format == KvFmt::kQ8_0) {
+        // q8_0: each attention block writes k_codes, k_scales, v_codes, v_scales, in that order, so that a load
+        // can walk the same runs back.  Same layout as card_row_bytes() sums to (n * card_row_bytes() / n_attn_).
+        const size_t crow = (size_t) n_kv_ * head_dim_,
+                     srow = (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t);
+        const size_t at_c = (size_t) first * crow, at_s = (size_t) first * srow;
+        const size_t n_c = (size_t) n * crow, n_s = (size_t) n * srow;
+        for (const Block& B : blocks_) {
+            if (!B.k_codes || n == 0) continue;
+            ck(cudaMemcpy(dst, (const uint8_t*) B.k_codes + at_c, n_c, cudaMemcpyDeviceToHost), "save rows");
+            dst += n_c;
+            ck(cudaMemcpy(dst, (const uint8_t*) B.k_scales + at_s, n_s, cudaMemcpyDeviceToHost), "save rows");
+            dst += n_s;
+            ck(cudaMemcpy(dst, (const uint8_t*) B.v_codes + at_c, n_c, cudaMemcpyDeviceToHost), "save rows");
+            dst += n_c;
+            ck(cudaMemcpy(dst, (const uint8_t*) B.v_scales + at_s, n_s, cudaMemcpyDeviceToHost), "save rows");
+            dst += n_s;
+        }
+        return;
+    }
     const size_t row = (size_t) n_kv_ * head_dim_ * sizeof(uint16_t), at = (size_t) first * row, bytes = (size_t) n * row;
     for (const Block& B : blocks_) {
-        if (B.gdn || bytes == 0) continue;
+        if (!B.keys || bytes == 0) continue;
         for (const uint16_t* cache : {B.keys, B.vals}) {
             ck(cudaMemcpy(dst, (const uint8_t*) cache + at, bytes, cudaMemcpyDeviceToHost), "save rows");
             dst += bytes;
@@ -184,15 +235,37 @@ void Qwen35::save_rows(int64_t first, int64_t n, uint8_t* dst) {
     }
 }
 
-void Qwen35::load_rows(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n) {
+void Qwen35::load_card_rows(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n) {
     if (from < 0 || first < from || n < 0 || first + n > from + count || first + n > opt_.max_context)
         throw std::logic_error("load_rows: the rows are outside what was saved");
     cover(first + n);
     ck(cudaStreamSynchronize(cs(st_)), "load rows");
+    if (opt_.kv_format == KvFmt::kQ8_0) {
+        // q8_0: mirror save_card_rows run for run, advancing by each run's own saved size (count * row) so
+        // multi-layer blobs line up; the rows wanted start `first - from` rows into the run.
+        const size_t crow = (size_t) n_kv_ * head_dim_,
+                     srow = (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t);
+        const size_t at_c = (size_t) first * crow, at_s = (size_t) first * srow;
+        const size_t n_c = (size_t) n * crow, n_s = (size_t) n * srow;
+        const size_t sk_c = (size_t) (first - from) * crow, sk_s = (size_t) (first - from) * srow;
+        const size_t all_c = (size_t) count * crow, all_s = (size_t) count * srow;
+        for (const Block& B : blocks_) {
+            if (!B.k_codes || n == 0) continue;
+            ck(cudaMemcpy((uint8_t*) B.k_codes + at_c, src + sk_c, n_c, cudaMemcpyHostToDevice), "load rows");
+            src += all_c;
+            ck(cudaMemcpy((uint8_t*) B.k_scales + at_s, src + sk_s, n_s, cudaMemcpyHostToDevice), "load rows");
+            src += all_s;
+            ck(cudaMemcpy((uint8_t*) B.v_codes + at_c, src + sk_c, n_c, cudaMemcpyHostToDevice), "load rows");
+            src += all_c;
+            ck(cudaMemcpy((uint8_t*) B.v_scales + at_s, src + sk_s, n_s, cudaMemcpyHostToDevice), "load rows");
+            src += all_s;
+        }
+        return;
+    }
     const size_t row = (size_t) n_kv_ * head_dim_ * sizeof(uint16_t), at = (size_t) first * row, bytes = (size_t) n * row;
     const size_t skip = (size_t) (first - from) * row, all = (size_t) count * row;
     for (const Block& B : blocks_) {
-        if (B.gdn || bytes == 0) continue;
+        if (!B.keys || bytes == 0) continue;
         for (uint16_t* cache : {B.keys, B.vals}) {
             ck(cudaMemcpy((uint8_t*) cache + at, src + skip, bytes, cudaMemcpyHostToDevice), "load rows");
             src += all;
@@ -267,7 +340,15 @@ void Qwen35::attn_store(Block& B, int64_t pos, int n) {
     head_norm_rope(kraw_, head_dim_, fp(B.k_norm), k_, head_dim_, n_kv_, n_rot_, theta_scale_, first, n, rms_eps_, st_,
                    nullptr, axes, sections_, at ? at + 1 : nullptr);
     lin(B.wv, xn_, v_, n, xq_);
-    if (at) {
+    if (opt_.kv_format == KvFmt::kQ8_0) {
+        if (at) {
+            store_q8_at(k_, B.k_codes, B.k_scales, n_kv_ * head_dim_, at, n, 0, st_);
+            store_q8_at(v_, B.v_codes, B.v_scales, n_kv_ * head_dim_, at, n, 0, st_);
+        } else {
+            store_q8(k_, B.k_codes, B.k_scales, n_kv_ * head_dim_, pos, n, st_);
+            store_q8(v_, B.v_codes, B.v_scales, n_kv_ * head_dim_, pos, n, st_);
+        }
+    } else if (at) {
         store_f16_at(k_, B.keys, n_kv_ * head_dim_, at, n, 0, st_);
         store_f16_at(v_, B.vals, n_kv_ * head_dim_, at, n, 0, st_);
     } else {
@@ -294,13 +375,23 @@ void Qwen35::attn(Block& B, int64_t pos, int n) {
                    st_, nullptr, axes, sections_, at ? at + 1 : nullptr);
     attn_store(B, pos, n);
     const float scale = 1.f / std::sqrt((float) head_dim_);
+    const bool q8 = opt_.kv_format == KvFmt::kQ8_0;
     // a prompt batch through cuBLAS; a few tokens with the kernels that give a token the same bits in any company
-    if (n >= kStageRows)
-        attend_batch(blas_, q_, B.keys, B.vals, pos, n, score_, (size_t) chunk_ * n_head_ * opt_.max_context, awork_,
-                     att_, head_dim_, n_head_, n_kv_, scale, st_);
-    else
-        attend(q_, B.keys, B.vals, pos, n, score_, chunk_, att_, head_dim_, n_head_, n_kv_, scale, st_, 0, 0, false,
-               at, at ? room(n) : 0);
+    if (n >= kStageRows) {
+        // a prompt batch: the fp16 path passes the caches where they lie (null caches and no workspace under q8);
+        // under q8 each block of K and V the products read is dequantized into q8w_ (kwork then vwork)
+        const uint16_t* kc = q8 ? nullptr : B.keys;
+        const uint16_t* vc = q8 ? nullptr : B.vals;
+        uint16_t* kw = q8 ? (uint16_t*) q8w_ : nullptr;
+        uint16_t* vw = q8 ? kw + work_halves_ : nullptr;
+        attend_batch(blas_, q_, kc, vc, pos, n, score_, (size_t) chunk_ * n_head_ * opt_.max_context, awork_,
+                     att_, head_dim_, n_head_, n_kv_, scale, st_, 0, 0, false,
+                     q8 ? Kvq8{B.k_codes, B.k_scales} : Kvq8{}, q8 ? Kvq8{B.v_codes, B.v_scales} : Kvq8{}, kw, vw,
+                     q8 ? work_halves_ : 0);
+    } else
+        attend(q_, q8 ? nullptr : B.keys, q8 ? nullptr : B.vals, pos, n, score_, chunk_, att_, head_dim_, n_head_,
+               n_kv_, scale, st_, 0, 0, false, at, at ? room(n) : 0, /*score_floats*/ 0,
+               q8 ? Kvq8{B.k_codes, B.k_scales} : Kvq8{}, q8 ? Kvq8{B.v_codes, B.v_scales} : Kvq8{});
     mul_sigmoid(att_, qg_ + head_dim_, head_dim_, n * n_head_, 2 * head_dim_, false, st_);
     lin(B.wo, att_, ao_, n);
 }
@@ -319,7 +410,7 @@ void Qwen35::layer_head(Layer& L, int il, int n) {
     rms_norm(r_, fp(L.ffn_norm), xn_, n_embd_, n, rms_eps_, st_);
     kernels::native_quantize_q8_1(xn_, xq_, n_embd_ * n, 1, st_);
     dbg("ffn_in", il, xn_, n_embd_);
-    if (!(mmq_ && n >= kStageRows)) moe_router(L, n);
+    if (!batched(L, n)) moe_router(L, n);
 }
 
 void Qwen35::layer_tail(Layer&, int, int n) { axpy(fo_, 1.f, r_, n * n_embd_, true, st_); }
@@ -330,7 +421,7 @@ void Qwen35::output_rows(int first, int rows, float* h) {
 
 // What ggml's MoE graph does for this model: a softmax over every expert's score, the n_used most likely, and
 // their weights made to sum to one.
-void Qwen35::route(int, const float* logits, int* ids, float* w, float* probs) const {
+void Qwen35::route(int, const float* logits, int32_t, int* ids, float* w, float* probs) const {
     float mx = logits[0];
     for (int e = 1; e < n_expert_; ++e) mx = std::max(mx, logits[e]);
     double all = 0.0;
@@ -348,6 +439,11 @@ void Qwen35::route(int, const float* logits, int* ids, float* w, float* probs) c
     }
     const float denom = std::max(sum, kMinWeightSum);
     for (int k = 0; k < n_used_; ++k) w[k] /= denom;
+}
+
+bool Qwen35::route_card(int, int n, int32_t* ids, float* w) {
+    route_rows(rl_, n_expert_, n_used_, n, 0, 1.f, nullptr, nullptr, true, 0.f, ids, w, st_);
+    return true;
 }
 
 // The shared expert, times the sigmoid of its own gate.  It runs on the GPU while the host routes.

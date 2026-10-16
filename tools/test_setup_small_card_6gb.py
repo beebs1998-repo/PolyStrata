@@ -139,7 +139,10 @@ class Figures(unittest.TestCase):
             self.assertEqual(setup.poly_check_ctx(setup.FAMILIES[fam], SIX), setup.POLY_CONTEXTS[0], fam)
         for vram in (8.0, 12.0, 16.0, 24.0, 31.84):                   # every card the project supports
             for fam in setup.FAMILIES:
-                self.assertIsNone(setup.poly_check_ctx(setup.FAMILIES[fam], vram), f"{fam} at {vram}")
+                sizes = setup.family_models(fam)
+                if not sizes or any(not setup.poly_too_small(d, vram) for d in sizes.values()):
+                    # a card one of the family's sizes fits at 32K: the 32K figures are its figures
+                    self.assertIsNone(setup.poly_check_ctx(setup.FAMILIES[fam], vram), f"{fam} at {vram}")
 
     def test_the_check_line_says_what_the_card_gets(self):
         """At 32K, the figure it was measured at, setup says the size does not fit and names the GB.  Judged at
@@ -178,7 +181,7 @@ class Install(unittest.TestCase):
             dst.write_bytes(b"")
             setup.mark(dst)
 
-        def fake_build(gpu, yes, llama, vision="none"):
+        def fake_build(gpu, yes, llama, vision="none", cuda_tk=None):
             self.built.append(gpu["archs"])
             eng = self.t / setup.ENGINE_POLY_DIR
             eng.mkdir(exist_ok=True)

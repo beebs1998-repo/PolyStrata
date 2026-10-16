@@ -111,7 +111,10 @@ class Estimates(unittest.TestCase):
         self.assertAlmostEqual(setup.poly_ram_need(setup.MODELS[M], 8.0), 117.2, delta=0.1)
 
     def test_check_lines(self):
-        self.assertIn("AMD", setup.poly_verdict(setup.MODELS[M], 256, 24.0, True))
+        with mock.patch.object(setup, "WIN", False):   # #11: AMD on Linux runs it
+            self.assertNotIn("does not run", setup.poly_verdict(setup.MODELS[M], 256, 24.0, True))
+        with mock.patch.object(setup, "WIN", True):
+            self.assertIn("AMD", setup.poly_verdict(setup.MODELS[M], 256, 24.0, True))   # only AMD on Windows is left out
         self.assertIn("does not fit", setup.poly_verdict(setup.MODELS[M], 256, 12.0, False))
         self.assertIn("fits by setup's estimate", setup.poly_verdict(setup.MODELS[M], 128, 31.84, False))
         self.assertIn("read from the SSD", setup.poly_verdict(setup.MODELS[M], 64, 31.84, False))
@@ -219,9 +222,9 @@ class Main(unittest.TestCase):
             dst.write_bytes(b"")
             setup.mark(dst)
 
-        def fake_build(gpu, yes, llama, vision="none"):
+        def fake_build(gpu, yes, llama, vision="none", toolkit=13):
             self.built.append(gpu["archs"])
-            self.encoder = vision
+            self.encoder, self.toolkit = vision, toolkit
             eng = self.t / setup.ENGINE_POLY_DIR
             eng.mkdir(exist_ok=True)
             (eng / "BUILD.json").write_text(json.dumps({"source": "local", "cuda_dirs": ["/cuda/lib64"]}))
@@ -356,6 +359,26 @@ class Main(unittest.TestCase):
         self.assertNotIn("--draft-model", args)                          # the draft block is in its last file
         self.assertEqual([Path(r[1]).name for r in self.runs], ["strata_tokenizer.py"])
 
+    def test_deepseek(self):
+        """DeepSeek V4 Flash: GLM's steps for Unsloth's three files, no draft block and no shipped profile."""
+        fam = setup.FAMILIES["deepseek"]
+        d = fam["models"]["UD-IQ2_XXS"]
+        files = [f"DeepSeek-V4-Flash-0731-UD-IQ2_XXS-0000{i}-of-00003.gguf" for i in (1, 2, 3)]
+        self.assertRegex(d["hf"], r"^https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF/resolve/[0-9a-f]{40}/"
+                                  r"UD-IQ2_XXS/$")
+        self.assertAlmostEqual(sum(fam["sha256"][f][0] for f in files) / 1e9, d["download_gb"], delta=0.05)
+        self.assertAlmostEqual(setup.poly_ram_need(d, 31.84), d["ram_gb"], delta=0.5)
+        code, out, cfg = self.main(family="deepseek")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.downloads, [d["hf"] + f for f in files])
+        self.assertEqual(self.verified, [(f, *fam["sha256"][f]) for f in files])
+        self.assertEqual([Path(r[1]).name for r in self.runs], ["strata_tokenizer.py"])
+        args = cfg["args"]
+        self.assertEqual(Path(args[args.index("--model") + 1]), self.t / "models" / "dsv4-UD-IQ2_XXS" / files[0])
+        self.assertNotIn("--draft-model", args)
+        self.assertFalse((self.t / "data" / "packs" / "dsv4-ud-iq2_xxs" / "expert-profile.txt").exists())
+        self.assertEqual(cfg["model_name"], "deepseek-v4-flash-ud-iq2_xxs")
+
     def test_too_little_ram(self):
         code, out, cfg = self.main(ram=40.0)
         self.assertNotEqual(code, 0)
@@ -387,6 +410,16 @@ class Main(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertEqual((cfg["gpu"], cfg["gpus_asked"]), (1, True))
 
+    def test_layer_split(self):
+        code, out, cfg = self.main(["--gpus", "0,1"], n_gpus=2)
+        self.assertEqual(code, 0, out)
+        self.assertEqual((cfg["gpu"], cfg["gpus_asked"], cfg["layer_split"]), ([0, 1], True, "auto"))
+        self.assertNotIn("runs on one GPU", out)
+        code, out, cfg = self.main(["--gpus", "0,1", "--layer-split", "30"], n_gpus=2)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(cfg["layer_split"], "30")
+        self.assertNotIn("--layer-split", next((ln for ln in out.splitlines() if "not used with" in ln), ""))
+
     def test_windows_is_asked(self):
         code, out, cfg = self.main(win=True, answers={})
         self.assertNotEqual(code, 0)
@@ -394,7 +427,7 @@ class Main(unittest.TestCase):
         self.assertEqual(self.built, [])
 
     def test_windows_is_not_asked_for_a_family_that_ran_there(self):
-        for family in ("qwen36", "ornith", "gemma4"):
+        for family in ("qwen36", "ornith", "gemma4", "tiel"):
             with self.subTest(family):
                 self.built = []
                 code, out, cfg = self.main(win=True, family=family, ram=32.0, vram=8.0)
@@ -402,10 +435,16 @@ class Main(unittest.TestCase):
                 self.assertNotIn("Windows", out)
                 self.assertEqual(len(self.built), 1)
 
-    def test_cuda_12_stops(self):
+    def test_cuda_12_compiles_the_engine_with_it(self):
         code, out, cfg = self.main(["--cuda", "12"])
-        self.assertNotEqual(code, 0)
-        self.assertIn("built for RTX 20 cards and newer", out)
+        self.assertEqual(code, 0, out)
+        self.assertEqual((self.built, self.toolkit), ([["120"]], 12))
+        self.assertIn("with CUDA 12 is compiled here", out)
+        self.assertEqual(cfg["cuda"], 12)
+        # a copy set up from this install keeps it; the same one set up again chooses again
+        self.assertEqual(setup.choices_from_config(next(self.t.glob("strata-glm*.json")))["cuda"], 12)
+        code, out, cfg = self.main()
+        self.assertEqual((cfg.get("cuda"), self.toolkit), (None, 13))
 
 
 if __name__ == "__main__":

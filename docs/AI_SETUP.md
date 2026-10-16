@@ -52,7 +52,7 @@ Requirements (details: [INSTALL.md](INSTALL.md#what-you-need)):
   driver. If the driver is missing or too old, tell the user to update it (NVIDIA App / nvidia.com/drivers, or AMD
   Software) and restart; do not install drivers yourself unless they ask.
 - **RAM:** 32 GB or more (see step 3). **Disk:** ~80 GB free, ideally on an NVMe SSD. **CPU:** x86-64 with AVX2. Without AVX2 (Xeon E5 v1/v2 and older) setup still installs, as an experimental and slow build it compiles on the PC (10-20 minutes): tell the user that before starting ([INSTALL.md](INSTALL.md#older-cpus-experimental)).
-- **OS:** Windows 10/11 or Linux (Ubuntu 22.04/24.04 are fully automatic).
+- **OS:** Windows 10/11 or Linux (Ubuntu 22.04/24.04 and Debian 12/13 are fully automatic; Debian 13 gets the oldest CUDA 13 its NVIDIA repo has, currently 13.1).
 
 If the PC does not meet them, say which part is missing and stop.
 
@@ -83,6 +83,17 @@ By the PC's RAM (ask the user whether they mainly want it for code - then the Co
 `--family glm` (GLM 5.3 Flash) is another model with its own engine, and experimental: Linux, one NVIDIA card with
 32 GB, 96 GB of RAM or more, a 114 GB download, no images. Take it only when the user asks for it, and read
 [GLM.md](GLM.md) first.
+
+`--family deepseek` (DeepSeek V4 Flash) runs on that engine too, as experimental: Linux, one NVIDIA card with
+32 GB, 72 GB of RAM or more by setup's estimate, a 91 GB download, no images. Take it only when the user asks for it,
+and read [DEEPSEEK.md](DEEPSEEK.md) first.
+
+`--family lfm25` (LFM2.5-24B-A2B, by Liquid AI) runs on that engine as well, experimental: Linux or Windows (setup
+compiles the engine there, as for the three below), one NVIDIA card, an 11 to 25 GB download, about 16 to 31 GB of
+RAM beside an 8 GB card by setup's estimate, no images. Leave `--model` out: setup takes UD-Q4_K_XL, or UD-Q3_K_XL
+on a PC with too little RAM for it; QAD-Q4_0, UD-Q6_K_XL and Q8_0 are by name. Its license allows commercial use
+only to companies with less than 10 million US dollars of yearly revenue. Take it only when the user asks for it,
+and read [LFM.md](LFM.md) first.
 
 `--family qwen36`, `--family ornith` and `--family gemma4` (Qwen3.6-35B-A3B, Ornith 1.5, Gemma 4 26B-A4B) are
 smaller models on GLM's engine, and experimental too: Linux or Windows, one NVIDIA card, an 11 to 24 GB download,
@@ -192,7 +203,9 @@ line when it is ready; the engine log is `strata-<model>.log` in the PolyStrata 
 - **Codex CLI and other Responses API apps:** `http://127.0.0.1:8080/v1/responses` (stateless; Codex's
   `config.toml`: [DETAILS.md](DETAILS.md#the-responses-api-and-codex-cli)).
 - **Claude Code:** `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`, `ANTHROPIC_MODEL` set to a Claude model name it knows
-  (PolyStrata ignores the name), and any `ANTHROPIC_AUTH_TOKEN` (or the configured key).
+  (PolyStrata ignores the name), and any `ANTHROPIC_AUTH_TOKEN` (or the configured key). Add
+  `"fit_max_tokens": true` to `strata-<model>.json`: Claude Code asks for 32,000 tokens of answer in every request,
+  and the server refuses a request whose prompt leaves less room than that in the context.
 - **Thinking level:** `"reasoning_effort": "none" | "low" | "medium" | "high"` (default high).
 - PolyStrata answers one request at a time; `"parallel": N` in the model's config (or setup `--parallel N`) decodes up to
   N together ([BATCHING.md](BATCHING.md)). API details: [DETAILS.md](DETAILS.md#using-it).

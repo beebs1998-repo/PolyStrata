@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 namespace strata::kernels {
 
@@ -37,6 +38,13 @@ bool native_mmvq_multi_exact();
 // not reconstruct that sum from the quantized integers.
 void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols,
                           void* stream);
+
+/// An RMS norm of `rows` rows of n values and native_quantize_q8_1() of its output in one launch, bit for bit what
+/// the two launches give: y = x / rms(x) * w as poly's rms_norm() writes it with `threads` a block (its
+/// sum_threads(n)), and y_q8_1 its Q8_1 blocks.  With `add` (null: none), x += add first, as axpy() adds, and x
+/// keeps the sum.  n is a multiple of 32.
+void native_add_rms_norm_q8_1(float* x, const float* add, const float* w, float* y, void* y_q8_1, int n, int rows,
+                              float eps, int threads, void* stream);
 
 void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_1,
                                  int n_in, int ncols, void* stream);
@@ -133,6 +141,22 @@ struct MmvqSlots {
     float* y[8];
 };
 bool native_mmvq_slots(int ggml_type, const MmvqSlots& slots, int count, int n_in, int n_out, void* stream);
+// native_mmvq_slots with the matrices the card picked, so that the launch needs nothing of the host (a decode
+// step's routed experts when every one of them is in VRAM): matrix j is table[ids[j]] + offset bytes, times the
+// Q8_1 column x + (j / x_every) * x_stride bytes, into y + j * y_stride floats.  count may pass 8.  False, with
+// nothing launched: there is no kernel for the format (native_mmvq_ids_supported() says so beforehand).
+struct MmvqIds {
+    const void* const* table;
+    const int32_t* ids;
+    std::size_t offset;
+    const void* x;
+    std::size_t x_stride;
+    int x_every;
+    float* y;
+    std::size_t y_stride;
+};
+bool native_mmvq_ids_supported(int ggml_type);
+bool native_mmvq_ids(int ggml_type, const MmvqIds& ids, int count, int n_in, int n_out, void* stream);
 
 // Storage/dispatch helpers take stable GGML type IDs, avoiding a ggml runtime
 // dependency in the engine: Q4_0=2, Q5_0=6, Q8_0=8, Q2_K=10, Q3_K=11, Q4_K=12, Q5_K=13,

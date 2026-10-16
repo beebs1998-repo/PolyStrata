@@ -17,9 +17,9 @@ namespace strata::poly {
 
 class Gemma4 final : public Engine {
 public:
-    size_t row_bytes() const override;
-    void save_rows(int64_t first, int64_t n, uint8_t* dst) override;
-    void load_rows(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n) override;
+    size_t card_row_bytes() const override;
+    void save_card_rows(int64_t first, int64_t n, uint8_t* dst) override;
+    void load_card_rows(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n) override;
     bool sees() const override { return true; }
     int64_t whole(int64_t at, int64_t m) const override;
 
@@ -36,7 +36,8 @@ protected:
     void layer_tail(Layer& L, int il, int n) override;
     void shift_rows(ptrdiff_t by) override;
     void output_rows(int first, int rows, float* h) override;
-    void route(int il, const float* logits, int* ids, float* w, float* tmp) const override;
+    void route(int il, const float* logits, int32_t token, int* ids, float* w, float* tmp) const override;
+    bool route_card(int il, int n, int32_t* ids, float* w) override;
     void moe_shared(const Layer& L, int il, int n) override;
     void router_scores(const Layer& L, int n) override;
     void finish_logits(float* logits, int rows) override;
@@ -62,6 +63,7 @@ private:
         Dev ffn_gate, ffn_up, ffn_down;   ///< the dense MLP
         Dev post_mlp, pre_moe, post_moe, post_ffn, rscale;
         std::vector<float> escale;   ///< what each expert's output is multiplied by
+        Dev escale_dev;              ///< the same on the card, when the file has it
         float out_scale = 1;
     };
 

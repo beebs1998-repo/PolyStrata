@@ -58,10 +58,6 @@ FALLBACK_MODELS = {
                        "with little else running", "download_gb": 83.6, "ram_gb": 62, "arena_gb": 50.3},
     "IQ1_M": {"about": "the Coder's only size: half the experts, stored like IQ3_S (3.5 bits)", "download_gb": 58.4,
               "ram_gb": 32, "arena_gb": 23.4, "families": ("coder",)},
-    "UD-Q4_K_XL": {"about": "4-bit (Unsloth Dynamic), EXPERIMENTAL: the best quality, but most experts come from the "
-                            "SSD on a 64 GB PC (7-8.5 tokens/s measured)", "download_gb": 111.3, "ram_gb": 48,
-                   "arena_gb": 77.0, "families": ("unsloth",), "budget": True, "experimental": True,
-                   "vision": True},                       # #967: images allowed (setup warns: untested with this file)
     "UD-IQ4_XS": {"about": "~4-bit i-quant (Unsloth Dynamic), between IQ3_S and UD-Q4_K_XL in quality; on a PC with "
                            "less than ~80 GB of RAM part of its experts are read from the SSD",
                   "download_gb": 93.7, "ram_gb": 48, "arena_gb": 59.5, "families": ("unsloth",), "budget": True,
@@ -72,6 +68,24 @@ FALLBACK_MODELS = {
                    "download_gb": 101.8, "ram_gb": 82, "arena_gb": 92.5, "families": ("glm",)},
     "REAP50-Q3_K_M": {"about": "half the routed experts (REAP50), 3-bit K-quant: less RAM", "download_gb": 78.8,
                       "ram_gb": 60, "arena_gb": 72.1, "families": ("glm",)},
+    "UD-Q4_K_XL": {"about": "4-bit (Unsloth Dynamic): K-quant experts, between UD-IQ4_XS and UD-Q5_K_XL in quality",
+                   "download_gb": 111.3, "ram_gb": 48, "arena_gb": 77.0, "families": ("unsloth",), "budget": True,
+                   "vision": True},                       # #967: images allowed (setup warns: untested with this file)
+    "UD-Q5_K_XL": {"about": "5-bit (Unsloth Dynamic): Q5_K experts with Q8_0 downs, close to Q8_0 in quality",
+                   "download_gb": 158.3, "ram_gb": 108, "arena_gb": 98.4, "families": ("unsloth",), "budget": True,
+                   "vision": True},
+    "UD-Q6_K_XL": {"about": "6-bit (Unsloth Dynamic): Q6_K experts with Q8_0 downs",
+                   "download_gb": 169.2, "ram_gb": 118, "arena_gb": 109.2, "families": ("unsloth",), "budget": True,
+                   "vision": True},
+    "Q8_0": {"about": "8-bit, the reference quality (every expert Q8_0); for a 192 GB PC",
+             "download_gb": 188.2, "ram_gb": 136, "arena_gb": 128.3, "families": ("unsloth",), "budget": True,
+             "vision": True},
+    "NVFP4": {"about": "4-bit NVFP4 experts, GPTQ (sergqwer's strata-nvfp4 pack); RTX 50 has FP4 tensor cores, other "
+                       "NVIDIA cards run it at 8-bit precision", "download_gb": 128.0, "ram_gb": 80, "arena_gb": 68.0,
+              "families": ("nvfp4",), "vision": True},
+    "NVFP4-NVIDIA": {"about": "NVIDIA's own NVFP4 checkpoint (plain rounding), converted by sergqwer; the same size "
+                              "and speed as NVFP4", "download_gb": 128.0, "ram_gb": 80, "arena_gb": 68.0,
+                     "families": ("nvfp4",), "vision": True},
 }
 FALLBACK_FAMILIES = {
     "qwen": {"title": "Qwen3.8-Flash-Next", "about": "the original model", "tag": ""},
@@ -79,13 +93,36 @@ FALLBACK_FAMILIES = {
                                              "authors' numbers)", "tag": "swift-"},
     "coder": {"title": "Qwen3.8-Flash-Next Coder", "about": "half the experts (code, tools, images kept): needs ~32 GB "
                                                             "of RAM, faster; weaker outside coding", "tag": "coder-"},
-    "unsloth": {"title": "Qwen3.8-Flash-Next (Unsloth)", "about": "UD-IQ4_XS: a 94 GB download; with less than ~80 GB "
-                                                                  "of RAM part of its experts are read from the SSD "
-                                                                  "(UD-Q4_K_XL, 111 GB: experimental)",
-                "tag": "unsloth-", "vision": False},
+    "unsloth": {"title": "Qwen3.8-Flash-Next (Unsloth)", "about": "UD-IQ4_XS, UD-Q4_K_XL, UD-Q5_K_XL, UD-Q6_K_XL or Q8_0 "
+                                                                  "(94 to 188 GB downloads): every expert in RAM from "
+                                                                  "~80 GB (UD-IQ4_XS) to ~136 GB (Q8_0) of RAM, else "
+                                                                  "part of them read from the SSD",
+                "tag": "unsloth-", "vision": True},
+    "nvfp4": {"title": "Qwen3.8-Flash-Next (NVFP4)", "about": "4-bit NVFP4 experts, NVIDIA cards; a 128 GB download, "
+                                                              "~80 GB of RAM to keep every expert in RAM",
+              "tag": "nvfp4-"},
     "glm": {"title": "GLM 5.3 Flash", "about": "another model, with its own engine: Linux, one NVIDIA card (run on "
                                                "32 GB), 64-128 GB of RAM", "tag": "glm-", "engine": "poly",
             "vision": False, "experimental": True},
+    "deepseek": {"title": "DeepSeek V4 Flash", "about": "another model on GLM's engine: Linux, one NVIDIA card (run on "
+                                                       "32 GB), ~72 GB of RAM beside it; a 91 GB download, no images",
+                 "tag": "dsv4-", "engine": "poly", "vision": False, "experimental": True,
+                 "models": {"UD-IQ2_XXS": {"about": "2-bit i-quant experts (Unsloth Dynamic), 3-bit and MXFP4 where "
+                                                    "they write", "download_gb": 90.9, "ram_gb": 72, "arena_gb": 83.9}}},
+    "lfm25": {"title": "LFM2.5-24B-A2B", "about": "on the strata-poly engine: one NVIDIA card, Linux or Windows; a "
+                                                   "15 GB file, ~20 GB of RAM beside an 8 GB card; four other sizes "
+                                                   "too, no images",
+              "tag": "lfm25-", "engine": "poly", "vision": False, "experimental": True,
+              "models": {"UD-Q4_K_XL": {"about": "4-bit experts (Unsloth Dynamic), 5- and 6-bit where they write",
+                                        "download_gb": 14.9, "ram_gb": 20, "arena_gb": 14.0},
+                         "UD-Q3_K_XL": {"about": "3-bit i-quant experts, 4-bit where they write: the least RAM",
+                                        "download_gb": 10.9, "ram_gb": 16, "arena_gb": 10.2},
+                         "QAD-Q4_0": {"about": "Liquid AI's 4-bit file, trained for that quantization",
+                                      "download_gb": 13.6, "ram_gb": 18, "arena_gb": 12.9},
+                         "UD-Q6_K_XL": {"about": "6-bit experts, 8-bit where they write",
+                                        "download_gb": 21.9, "ram_gb": 27, "arena_gb": 20.9},
+                         "Q8_0": {"about": "8-bit throughout: the closest to the model as trained",
+                                  "download_gb": 25.5, "ram_gb": 31, "arena_gb": 24.4}}},
     # a family with sizes of its own ("models"): two of these have a size of one name
     "qwen36": {"title": "Qwen3.6-35B-A3B", "about": "on the strata-poly engine: one NVIDIA card, Linux or Windows; a "
                                                      "17 GB file, ~21 GB of RAM beside an 8 GB card; a smaller and a "
@@ -116,6 +153,26 @@ FALLBACK_FAMILIES = {
                                                   "draft model", "download_gb": 11.0, "ram_gb": 15, "arena_gb": 8.7},
                           "UD-Q4_K_M": {"about": "4- and 5-bit experts (Unsloth Dynamic); the same draft model",
                                         "download_gb": 17.4, "ram_gb": 21, "arena_gb": 14.3}}},
+    "tiel": {"title": "Tiel Coder 35B-A3B", "about": "Ornith 1.5 quantized for coding, with the Sharp chat template; a "
+                                                    "17 GB file, ~21 GB of RAM beside an 8 GB card; a smaller and a "
+                                                    "larger size too", "tag": "tiel-",
+             "engine": "poly", "vision": True, "experimental": True,
+             "models": {"UD-Q3_K_XL": {"about": "3-bit i-quant experts, 4-bit where they write; its draft block in "
+                                                "the file", "download_gb": 17.2, "ram_gb": 21, "arena_gb": 14.6},
+                        "UD-IQ3_XXS": {"about": "2-bit i-quant experts, 3-bit where they write: the least RAM",
+                                       "download_gb": 13.6, "ram_gb": 18, "arena_gb": 11.5},
+                        "UD-Q4_K_XL": {"about": "4-bit experts, 5- and 6-bit where they write",
+                                       "download_gb": 22.7, "ram_gb": 27, "arena_gb": 20.0}}},
+    "minicpmv": {"title": "MiniCPM-V 4.7 35B-A3B", "about": "Qwen3.6-35B-A3B's architecture, OpenBMB's weights, and it "
+                                                            "reads pictures too; a 22 GB file, ~25 GB of RAM beside an "
+                                                            "8 GB card; a smaller and a larger size too",
+                 "tag": "minicpmv-", "engine": "poly", "vision": True, "experimental": True,
+                 "models": {"Q4_K_M": {"about": "4-bit experts (K-quant), 5- and 6-bit where they write",
+                                       "download_gb": 21.2, "ram_gb": 25, "arena_gb": 19.5},
+                            "mix_q3gud_im": {"about": "3- and 4-bit experts (imatrix mix): the least RAM",
+                                             "download_gb": 15.5, "ram_gb": 19, "arena_gb": 13.8},
+                            "Q6_K": {"about": "6-bit experts (K-quant)",
+                                     "download_gb": 28.5, "ram_gb": 31, "arena_gb": 26.4}}},
 }
 FALLBACK_CONTEXTS = [8192, 32768, 65536, 131072, 204800, 262144, 393216, 524288]
 BENCH_PROMPT = ("Write a short story (about 300 words) about a lighthouse keeper who finds a message in a bottle. "
@@ -725,8 +782,8 @@ class Strata:
         else:
             return {"family": None, "model": None, "why": f"{ram:.0f} GB of RAM: Qwen3.8-Flash-Next needs 32 GB or "
                                                           "more (its smallest, the Coder, keeps ~23 GB of experts in "
-                                                          "RAM); the 13-17 GB models (family qwen36, ornith or "
-                                                          "gemma4: Linux, experimental) want 18-22 GB"}
+                                                          "RAM); the 11-24 GB models (family qwen36, ornith, "
+                                                          "gemma4 or tiel: experimental) want 15-28 GB"}
         ctx = 32768 if vram < 14 else 65536 if vram < 20 else 131072
         if vram < 11:
             notes.append("less than 12 GB of VRAM: it runs, but slowly (most experts stay on the CPU)")
@@ -757,10 +814,14 @@ class Strata:
                 if ram is not None:
                     verdict = "fits" if ram >= d["ram_gb"] else "tight" if ram >= d["ram_gb"] - 8 else "does not fit"
                     try:
-                        if d.get("budget"):
+                        if d.get("budget") and S and hasattr(S, "unsloth_budget") and not S.unsloth_budget(m, ram):
+                            verdict = ("experimental: " if d.get("experimental") else "") + "fits (all of its experts in RAM)"
+                        elif d.get("budget"):
                             verdict = (("experimental: " if d.get("experimental") else "")
                                        + "part of its experts in RAM, the rest read from the SSD"
-                                       if ram >= d["ram_gb"] else "does not fit")
+                                       if ram >= d["ram_gb"] else
+                                       "slow here: part of its experts in RAM, the rest read from the SSD (setup "
+                                       "asks first)" if ram >= 48 else "does not fit")
                         elif S and m in models and S.low_ram_needed(m, ram) and S.low_ram_fits(m, ram, vram):
                             verdict = "fits in the low-RAM mode (slower: the GPU holds part of the experts)"
                     except Exception:                   # noqa: BLE001
@@ -994,8 +1055,10 @@ def tool_defs(models: dict, families: dict, contexts: list) -> list:
         {"name": "strata_models", "title": "PolyStrata models",
          "description": "The models and sizes PolyStrata's setup offers (families: qwen = Qwen3.8-Flash-Next, swift = "
                         "Swift 1.5, coder = the Coder, unsloth = Unsloth's ~4-bit, glm = GLM 5.3 Flash, another "
-                        "model with its own engine, qwen36 = Qwen3.6-35B-A3B, ornith = Ornith 1.5 and gemma4 = "
-                        "Gemma 4 26B-A4B, 13-17 GB models on that engine), with download size, RAM needed, "
+                        "model with its own engine, deepseek = DeepSeek V4 Flash on that engine, lfm25 = LFM2.5-24B-A2B, "
+                        "qwen36 = Qwen3.6-35B-A3B, ornith = Ornith 1.5, gemma4 = Gemma 4 26B-A4B and tiel = Tiel "
+                        "Coder 35B-A3B, 11-25 GB models on that engine), with "
+                        "download size, RAM needed, "
                         "whether each fits this PC, which are installed, the context lengths, and the recommendation. "
                         "Read-only.",
          "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}},
@@ -1012,13 +1075,17 @@ def tool_defs(models: dict, families: dict, contexts: list) -> list:
              "family": {"type": "string", "enum": list(families),
                         "description": "qwen = Qwen3.8-Flash-Next (the original), swift = Swift 1.5 (thinks "
                                        "shorter), coder = the Coder (half the experts, ~32 GB RAM, for code), "
-                                       "unsloth = Unsloth's ~4-bit (UD-IQ4_XS; UD-Q4_K_XL is "
-                                       "experimental), part of the experts read from the SSD, glm = GLM 5.3 "
+                                       "unsloth = Unsloth's 4- to 8-bit files (UD-IQ4_XS, UD-Q4_K_XL, UD-Q5_K_XL, "
+                                       "UD-Q6_K_XL, Q8_0): every expert in RAM where they fit, else part of them read "
+                                       "from the SSD, glm = GLM 5.3 "
                                        "Flash (another model: Linux, one NVIDIA card, 64-128 GB of RAM, a 79 or "
-                                       "114 GB download, no images), qwen36 = Qwen3.6-35B-A3B, ornith = Ornith "
-                                       "1.5, gemma4 = Gemma 4 26B-A4B (GLM's engine: one NVIDIA card, a "
-                                       "13-17 GB download, 18-22 GB of RAM beside an 8 GB card by setup's "
-                                       "estimate; images with vision)"},
+                                       "114 GB download, no images), deepseek = DeepSeek V4 Flash (GLM's "
+                                       "engine: Linux, one NVIDIA card, ~72 GB of RAM beside a 32 GB card, a 91 "
+                                       "GB download, no images), lfm25 = LFM2.5-24B-A2B, qwen36 = "
+                                       "Qwen3.6-35B-A3B, ornith = Ornith 1.5, gemma4 = Gemma 4 26B-A4B, tiel = "
+                                       "Tiel Coder 35B-A3B (GLM's engine: one NVIDIA card, an 11-25 GB download, "
+                                       "15-31 GB of RAM beside an 8 GB card by setup's estimate; images with "
+                                       "vision except LFM2.5)"},
              "model": {"type": "string", "enum": list(dict.fromkeys(
                            [*models, *(m for f in families.values() for m in f.get("models", ()))])),
                        "description": "the size (quantization): see strata_models"},
@@ -1285,6 +1352,8 @@ class Tools:
                 model = S.poly_default(sizes, hw["ram_gb"], max(cards, default=0.0))
         elif family is None:
             fams = [f for f in families if model in s.sizes(f)]
+            if len(fams) > 1:                   # a family's own size yields to MODELS' (Tiel's UD-Q4_K_XL)
+                fams = [f for f in fams if "models" not in families[f]] or fams
             if len(fams) > 1 and "qwen" not in fams:
                 raise ToolError(f"{model} is a size of " + " and of ".join(families[f]["title"] for f in fams)
                                 + ": give family too (" + " or ".join(fams) + ")")
@@ -1297,7 +1366,8 @@ class Tools:
             usable = [g for g in hw.get("gpus", []) if g.get("usable")]
             vram = max((g["vram_gb"] for g in usable), default=12)
             context = 32768 if vram < 14 else 65536 if vram < 20 else 131072
-            if d.get("budget"):
+            if d.get("budget") and (not hasattr(s.setup_module(), "unsloth_budget") or
+                                                s.setup_module().unsloth_budget(model, hw.get("ram_gb") or 0.0)):
                 context = 8192 if vram < 14 else 32768
             if families[family].get("engine") == "poly":
                 context = 32768                         # the one it was measured with, setup's own default

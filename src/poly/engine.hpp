@@ -7,6 +7,11 @@
 // Engine is what every architecture shares.  An architecture is a class derived from it (glm5next.hpp, qwen35.hpp,
 // gemma4.hpp) that reads the model's shape, loads a layer's weights and composes a layer from the kernels;
 // Engine::open() picks it by the file's general.architecture.
+//
+// On several cards (Options::layer_split) each card has an engine of its own for a run of the layers, with their
+// weights, caches, state and expert cache, and the last one has the output and the draft block.  The first one is
+// the one the caller holds: it runs its layers, hands the rows of the residual on to the next one through host
+// memory, and the next one goes on from them.
 #pragma once
 
 #include "cpu_experts.hpp"
@@ -14,6 +19,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -30,6 +36,9 @@ namespace strata::poly {
 class Shards;
 struct Likeliest;
 
+/// The attention caches' storing format: fp16 (default) or ggml Q8_0; opt-in via --kv.
+enum class KvFmt { kFp16 = 0, kQ8_0 = 1 };
+
 struct Options {
     std::string model;
     int max_context = 8192;
@@ -44,15 +53,21 @@ struct Options {
     int stage_mib = 2048;         ///< the buffer the experts that are not cached pass through: by default about
                                   ///< what a layer of Q2_K experts leaves out of the cache, and never more than
                                   ///< a layer's experts take
-    int stage_ahead = 256;        ///< from this many tokens, a call routes to most of a layer's experts, and the
+    int stage_ahead = 1024;       ///< from this many tokens, a call routes to most of a layer's experts, and the
                                   ///< ones that are not cached start their copy before the layer has routed; in a
-                                  ///< read of several calls every call does; 0: never
+                                  ///< read of several calls and this many tokens every call does; 0: never.  Under
+                                  ///< it a call copies only the experts it routes to, which with 8 GB of VRAM was
+                                  ///< the faster of the two up to about 1,000 tokens
+    float cpu_share = -1;         ///< of the experts outside VRAM that such a call routes to, the share the CPU
+                                  ///< computes while the others are copied: the ones the fewest tokens chose;
+                                  ///< below 0: as the two took the time between them; 0: none
     int expert_swaps = 64;        ///< experts on their way into the cache at a time while an answer is written, each
                                   ///< to the slot of one the answer uses less; 0: the cache stays as it was loaded
     bool stay_near = true;        ///< with several NUMA nodes, keep the CPU threads on the one that holds the experts
     bool graphs = true;           ///< a token's fixed launches are recorded once, a CUDA graph a layer, and replayed
     bool kv_grow = true;          ///< the attention caches get VRAM as the sequence grows, where the card can map it
                                   ///< so; false: for the whole context at load, as the expert cache gets the rest
+    KvFmt kv_format = KvFmt::kFp16;   ///< the K and V caches' format; fp16 by default (byte-identical path)
     int window = 0;               ///< the most tokens window() takes: the known one and guesses after it; 1: none;
                                   ///< 0: 8, or 4 where every guess keeps a copy of the recurrent state
     bool draft = true;            ///< run the block that guesses ahead, when there is one and window is above 1
@@ -63,6 +78,9 @@ struct Options {
     int tail_skip = 0;            ///< a routed expert outside VRAM that every token of a call ranks this far down or
                                   ///< further (the router's first choice is 0) is left out (--tail-skip,
                                   ///< STRATA_ROUTE_TAIL_SKIP); 0: none is
+    std::string layer_split;      ///< the layers across the CUDA devices this process sees, in their order: "auto"
+                                  ///< (by each card's free VRAM) or the first layer of each later card ("20,30");
+                                  ///< empty, or one device: the current card alone
 };
 
 /// A thing a model's file may call by other names than the engine does: converters differ.
@@ -81,6 +99,7 @@ struct Dev {
 /// What a layer has in every architecture.  Its attention's weights, and a dense FFN's, are the architecture's.
 struct Layer {
     bool moe = false;
+    bool mmq = false;     ///< the card has MMQ tiles for its routed experts' types (Engine::batched())
     bool fixed = false;   ///< one token's launches can be recorded and replayed for the next ones (eval()): they
                           ///< are the same for every token, or read the position on the card (Engine::at_)
     Dev attn_norm, ffn_norm;   ///< the norms ahead of the attention and of the FFN
@@ -97,11 +116,14 @@ struct Layer {
     size_t slot_bytes = 0;             ///< from a slot of the layer to the one behind it: whole blocks of both types
     std::vector<int32_t> ahead;        ///< experts a full prompt batch stages before it routes
     int trade = -1;                    ///< layers with the same number can take each other's slots: same size
+    int8_t card = -1;                  ///< a few tokens' experts routed and found on the card (moe_card()): 1 yes,
+                                       ///< 0 no (the architecture routes this layer on the host), -1 not tried
     // What a call of a few tokens hands the card, recorded (Engine::run()): by the call's tokens, and the head
     // also by Engine::head_key()
     std::vector<void*> heads;          ///< up to the router
     std::vector<void*> shared;         ///< the shared expert
     std::vector<void*> tail;           ///< after the experts
+    std::vector<void*> card_moe;       ///< the routed experts, routed on the card (moe_card())
 };
 
 /// A routed expert is run from the VRAM cache or on the CPU when tokens come a few at a time, as an answer's do
@@ -161,11 +183,12 @@ public:
     /// Feed n tokens from position pos().  With want_logits, logits() then holds the scores of the token after the
     /// last one.
     void eval(const int32_t* tokens, int n, bool want_logits);
-    const float* logits() const { return h_logits_; }
+    const float* logits() const { return next_ ? next_->logits() : h_logits_; }
     /// Feed n tokens of a prompt, none of them a picture's row, as eval() without logits would in calls of
     /// max_rows(): the same tokens a call.  With experts outside the cache it is faster than those calls, the
-    /// more the more of them n is.  The result is the calls' own bit for bit, but for a call of fewer than
-    /// stage_ahead tokens beside others: its experts' sums are split as a larger call's, not as on its own.
+    /// more the more of them n is; under stage_ahead tokens it makes those calls.  The result is the calls' own
+    /// bit for bit, but for a call of fewer than stage_ahead tokens beside others: its experts' sums are split as a
+    /// larger call's, not as on its own.
     ///
     /// A mark is a place inside the read where the caller would have stopped between two calls: `at` of the
     /// read's tokens come before it.  The calls end there as they would have, and `state`, when it is not null,
@@ -198,7 +221,7 @@ public:
     /// What a kept token computed is what eval() would have computed for it.
     int max_window() const { return opt_.window; }
     void window(const int32_t* tokens, int t);
-    const float* logits_of(int i) const { return h_wlogits_ + (size_t) i * n_vocab_; }
+    const float* logits_of(int i) const { return next_ ? next_->logits_of(i) : h_wlogits_ + (size_t) i * n_vocab_; }
     void keep(int n);
 
     /// Some files carry a block that guesses ahead: one layer that takes a token and the model's output for the
@@ -208,42 +231,55 @@ public:
     /// in the model's place.  p is the probability the block gives what it returns.  pos() + i must be inside the
     /// context.  logits() is left alone.  An architecture may guess with a small model of its own instead of a
     /// block (draft_step()); the calls are the same.
-    bool drafts() const { return draft_; }
+    bool drafts() const { return next_ ? next_->drafts() : draft_; }
+    /// Test only: the calls read()'s layer-major path gave the draft block's rows (draft_rows()) on the card that has
+    /// the block, since load.  Two or more in one read are back-to-back refills of its pinned input rows.
+    int64_t read_draft_calls_for_test() const { return next_ ? next_->read_draft_calls_for_test() : read_draft_calls_; }
     int32_t draft(int32_t token, int i, float* prob);
     /// Whether a call since the last time this was asked recorded launches for replaying, which takes far longer
     /// than the call does afterwards: its time says nothing of the calls to come.
-    bool took_record() { return std::exchange(recorded_, false); }
+    bool took_record() {
+        const bool later = next_ && next_->took_record();
+        return std::exchange(recorded_, false) || later;
+    }
 
     // A sequence's state, to leave the sequence and come back to it.  The recurrent layers have a state that
     // every token changes.  Each token also leaves a row in the attention caches, which stays as it was written.
-    size_t state_bytes() const { return state_n_ * sizeof(float) + extra_bytes(); }
-    virtual size_t row_bytes() const = 0;
+    // On several cards: the first card's part, then the next one's.
+    size_t state_bytes() const { return card_state_bytes() + (next_ ? next_->state_bytes() : 0); }
+    size_t row_bytes() const { return card_row_bytes() + (next_ ? next_->row_bytes() : 0); }
     /// The recurrent state at pos(), state_bytes() long.
     void save_state(uint8_t* dst);
     /// Back to position `pos` with the recurrent state it had there.  The rows before pos must be the sequence's.
     void load_state(const uint8_t* src, int64_t pos);
     /// The rows of positions [first, first + n), n * row_bytes() long: layer after layer, a layer's rows together.
-    virtual void save_rows(int64_t first, int64_t n, uint8_t* dst) = 0;
+    void save_rows(int64_t first, int64_t n, uint8_t* dst);
     /// Rows [first, first + n) out of what save_rows wrote for [from, from + count).
-    virtual void load_rows(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n) = 0;
+    void load_rows(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n);
 
-    const Stats& stats() const { return stats_; }
-    int cached_experts() const { return cached_; }
-    int total_experts() const { return n_moe_ * n_expert_; }
-    double cached_gib() const { return double(exp_at_) / double(1ull << 30); }
+    const Stats& stats() const;
+    int cached_experts() const { return cached_ + (next_ ? next_->cached_experts() : 0); }
+    int total_experts() const { return n_moe_ * n_expert_ + (next_ ? next_->total_experts() : 0); }
+    double cached_gib() const { return double(exp_at_) / double(1ull << 30) + (next_ ? next_->cached_gib() : 0); }
     /// The cache as load() filled it, which is as large as resize_cache() makes it again.
-    int full_experts() const { return full_cached_; }
-    double full_gib() const { return double(full_bytes_) / double(1ull << 30); }
-    /// The VRAM the cache was last sized to leave free, and what is free now, in MiB.
+    int full_experts() const { return full_cached_ + (next_ ? next_->full_experts() : 0); }
+    double full_gib() const { return double(full_bytes_) / double(1ull << 30) + (next_ ? next_->full_gib() : 0); }
+    /// The VRAM the cache was last sized to leave free, and what is free now, in MiB: on several cards, the
+    /// first card's reserve and the least that one of them has free.
     int reserve_mib() const { return reserve_mib_; }
     int64_t vram_free_mib() const;
     /// The expert cache sized again, to leave `mib` of VRAM free (below 0: what load() left), and filled with the
-    /// experts used most so far.  It gets no larger than load() made it.  Between calls that feed tokens: the
-    /// experts it gives up are computed on the CPU from then on, as any expert outside it.
+    /// experts used most so far.  Without VMM it gets no larger than load() made it.  Between calls that feed
+    /// tokens: the experts it gives up are computed on the CPU from then on, as any expert outside it.
     void resize_cache(int mib);
-    /// Between requests: sizes the cache again when what the engine allocated since has left less than a quarter
-    /// of the reserve free.  True when it did.
+    /// Between requests: the cache gives up VRAM when little is free, and takes VRAM that came free (see the
+    /// definition for how much stays free).  True when it changed.
     bool mind_vram();
+    /// At a request's start, the engine at the furthest point of its `end` tokens it could come back to: the
+    /// attention caches give back the rows past `end` that the request before did not reach either.  One long
+    /// request leaves them grown, and the expert cache would stay that much smaller for every request after it.
+    /// Returns the bytes given back, which mind_vram() hands to the expert cache.
+    size_t trim_kv(int64_t end);
     void save_profile() const;
 
 protected:
@@ -270,8 +306,13 @@ protected:
     /// How many of the vocabulary's first tokens hold nearly every token an answer writes; 0: the order says
     /// nothing of that.
     virtual int guess_vocab() const { return 0; }
-    /// The layers' places in state_, and the attention's caches: a row a position.
+    /// The layers' places in state_, and the attention's caches: a row a position.  Only for the layers this
+    /// engine runs (runs()).
     virtual void alloc_caches() = 0;
+    /// What row_bytes(), save_rows() and load_rows() are for the layers this engine runs.
+    virtual size_t card_row_bytes() const = 0;
+    virtual void save_card_rows(int64_t first, int64_t n, uint8_t* dst) = 0;
+    virtual void load_card_rows(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n) = 0;
     /// The scratch of the architecture's own kernels, a fbuf() each.  Called twice: the first time only counts.
     virtual void assign_scratch() = 0;
     /// The widest input lin() gets, beside the model's width and the FFNs'.
@@ -284,9 +325,16 @@ protected:
     virtual void layer_tail(Layer& L, int il, int n) = 0;
     /// The model's output for `rows` tokens from row `first` of the call, normed: what the output matrix takes.
     virtual void output_rows(int first, int rows, float* h) = 0;
-    /// A token's experts and their weights from its scores at layer il's router.  tmp: 2 * n_expert_ floats of
-    /// scratch.  A prompt batch's tokens are routed by several threads at once: it changes nothing of the engine's.
-    virtual void route(int il, const float* logits, int* ids, float* w, float* tmp) const = 0;
+    /// A token's experts and their weights from its scores at layer il's router.  `token` is the token the row is
+    /// for, or -1 where it has none (a picture's row, the draft block).  tmp: 2 * n_expert_ floats of scratch.  A
+    /// prompt batch's tokens are routed by several threads at once: it changes nothing of the engine's.
+    virtual void route(int il, const float* logits, int32_t token, int* ids, float* w, float* tmp) const = 0;
+    /// A prompt batch's routing on the card: n tokens' experts and weights from their scores in rl_, n_used_ a token
+    /// into ids and w (on the card), what route() gives them up to the last bits of a weight.  False: the host routes.
+    virtual bool route_card(int il, int n, int32_t* ids, float* w) {
+        (void) il, (void) n, (void) ids, (void) w;
+        return false;
+    }
     /// The shared expert, into fo_.  It runs on the GPU while the host routes.
     virtual void moe_shared(const Layer& L, int il, int n) = 0;
     /// The scores of a layer's router for n tokens, into rl_.  The engine's own: the router's matrix times the
@@ -326,6 +374,14 @@ protected:
     virtual const Names* meta_alias(const char* key) const { (void) key; return nullptr; }
 
     // ---- what it builds on ----
+    /// Whether layer il is this engine's: one of [lo_, hi_), or the draft block on the card that ends the model.
+    bool runs(int il) const { return il >= lo_ && (il < hi_ || hi_ == n_layer_); }
+    size_t card_state_bytes() const { return state_n_ * sizeof(float) + extra_bytes(); }
+    /// Every expert of this engine's layers is in its cache.
+    bool all_cached() const { return cached_ == n_moe_ * n_expert_; }
+    /// The rows a call of n tokens leaves in r_, to h (pinned) for the next card's engine, which goes on from them.
+    void hand_on(int64_t pos, int n, float* h);
+    float* pass_rows(int n);
     /// kGuessMat: quantized again to Q4_0, for a matrix only guesses are made with: a guess is checked, so a less
     /// exact one costs a wrong guess now and then and no token.
     enum Want { kF32, kFloatMat, kAnyMat, kGuessMat };
@@ -339,6 +395,7 @@ protected:
     float shape_f(const char* key) const;
     void load_shape();
     void load_moe(int il, bool shared = true);
+    void mxfp4_to_q5_0(int il);
     void alloc();
     void shared_scratch();
     float* draft_input(const int32_t* tokens, int64_t row, const float* h, int n);
@@ -356,11 +413,17 @@ protected:
     void save_last(uint8_t* dst);
     void moe_router(const Layer& L, int n);
     bool moe(Layer& L, int il, int n, const std::function<void()>* first = nullptr);
+    bool card_moe(int n);
+    bool moe_card(Layer& L, int il, int n);
+    /// Whether n tokens take layer L's routed experts as a prompt batch, through MMQ (moe_rows()), and not a few at
+    /// a time (moe()).
+    bool batched(const Layer& L, int n) const;
     void moe_add(int n);
     template <class F>
     void* record(F&& work);
     void moe_rows(Layer& L, int il, int n);
-    void stage(const Layer& L, const int32_t* experts, int m, void* stream);
+    void stage(const Layer& L, const int32_t* experts, int m, void* stream, bool alone = false);
+    void mind_memory();
     void follow(int written);
     void follow_loop();
     void embed(int32_t token, float* dst) const;
@@ -392,14 +455,33 @@ protected:
     void vmm_unmap(Mapped& m, size_t bytes);
     void vmm_free(Mapped& m);
     void shrink_cache(size_t bytes);
+    int grow_cache(size_t bytes);
+    void resize_card_cache(int mib);   ///< resize_cache() and mind_vram() for this engine's card
+    bool mind_card_vram();
+    size_t trim_card_kv(int64_t end);
+    int64_t kv_rows_for(int64_t end) const;   ///< the rows cover() maps for `end`
+    void held_is_budget();
     void settle_swaps();
 
     Options opt_;
     std::unique_ptr<Shards> gg_;
     std::unique_ptr<Shards> dg_;      ///< Options::draft_model, while the draft block is read from it
     const Shards* block_ = nullptr;   ///< the file the draft block is in: gg_ or dg_
-    std::unique_ptr<Workers> workers_;
+    std::shared_ptr<Workers> workers_;   ///< on several cards, one for all of them: they take turns
     int node_ = -1;
+    // A layer split (open()).  The layers of the model are [lo_, hi_) here, and the engine of the next card has
+    // the ones after.  A later card's engine reads its first layer's input from pass_, which the one before wrote:
+    // a row of the residual a position, from pass_at_.
+    int lo_ = 0, hi_ = 0;
+    int end_ = -1;                        ///< what open() asked for hi_; -1: the model's end
+    bool split_ = false;                  ///< one of several engines: a call sets its card first
+    std::unique_ptr<Engine> next_;
+    int64_t read_draft_calls_ = 0;               ///< read_draft_calls_for_test()
+    const float* pass_ = nullptr;
+    int64_t pass_at_ = 0;
+    float* h_pass_ = nullptr;             ///< pinned; h_pass_rows_ tokens' rows
+    int h_pass_rows_ = 0;
+    mutable Stats all_stats_;             ///< stats() of every card's engine together
     double node_share_ = 0;
     std::thread mapper_;                  ///< reads the experts' pages once after load, so they are mapped
     std::atomic<bool> map_quit_{false};
@@ -409,6 +491,8 @@ protected:
     void* ev_row_[8] = {}; ///< one for each token a window can have
     std::vector<void*> dev_allocs_, host_allocs_;
     std::vector<void*> graphs_;   ///< every recorded graph, to destroy
+    std::map<std::vector<int>, void*> passes_;   ///< a call's layers recorded as one (run()): by its tokens and
+                                                 ///< every layer's head_key()
     void* tail_ = nullptr;        ///< one token's launches from the last layer to the logits, recorded
     // A recorded launch cannot be given the position as an argument: it reads it here when it runs.  eval() writes
     // the token's place in the sequence and its rotary position before it replays the layers.
@@ -439,6 +523,7 @@ protected:
     std::vector<float> clamp_exp_, clamp_shexp_;   ///< a layer's SwiGLU limits: the routed experts', the shared one's
 
     std::vector<Layer> layers_;   ///< the model's, and after them the draft block
+    std::vector<std::unique_ptr<uint8_t[]>> converted_;   ///< experts converted at load (mxfp4_to_q5_0), in RAM
     Dev out_norm_, output_;
     bool draft_ = false;
     bool block_layer_ = false;    ///< what guesses ahead is a block after the model's layers (layers_' last)
@@ -457,9 +542,12 @@ protected:
     size_t grain_ = 0;           ///< what the card maps VRAM in
     std::vector<Kv> kv_;         ///< the attention caches that grow with the sequence
     int64_t kv_rows_ = 0;        ///< the rows they have VRAM for
+    int64_t kv_reach_ = 0;       ///< the furthest row cover() was asked for since the last trim_kv()
     size_t budget_ = 0;          ///< their VRAM and the expert cache's together, as the cache was filled
     int asked_reserve_mib_ = -1; ///< Options::vram_reserve_mib as load() got it
     int reserve_mib_ = 0;        ///< what the cache was sized to leave free
+    bool ram_tight_ = false;     ///< the machine's RAM is within 4 GiB of the model's files (fill_expert_cache())
+    int minds_ = 0;              ///< mind_vram()'s calls
     int full_cached_ = 0;        ///< the cache as load() filled it: its experts and their bytes
     size_t full_bytes_ = 0;
     float* scratch_ = nullptr;
@@ -511,12 +599,18 @@ protected:
     void* mqx_ = nullptr;                                   ///< lin()'s tokens quantized for a product
     int32_t *tab_ = nullptr, *h_tab_ = nullptr;   ///< a layer's row tables, in VRAM and pinned
     int32_t* iota_ = nullptr;                     ///< 0, 1, 2, ...
+    int32_t* d_ids_ = nullptr;                    ///< a batch's experts and weights when it routes on the card
+    float* d_wts_ = nullptr;
+    int32_t* h_ids_ = nullptr;                    ///< pinned: the experts, back from the card
+    void** d_slots_ = nullptr;                    ///< every layer's L.slot on the card, n_expert_ a layer (moe_card())
+    std::vector<void*> h_slots_;                  ///< what d_slots_ holds
     uint8_t* stage_ = nullptr;                    ///< experts that are not cached, on their way through VRAM
     uint8_t* h_stage_[2] = {};                    ///< pinned; filled in turn
     void* ev_stage_[2] = {};                      ///< marks the upload out of each
     void* up_ = nullptr;                          ///< the stream of the uploads that start before the routing
     void* ev_ahead_ = nullptr;                    ///< marks the last of them
     void* ev_free_ = nullptr;                     ///< marks a layer's last read of the staging buffer
+    void* ev_hr_ = nullptr;                       ///< marks the card's last read of h_r_ by draft_input()
     int staged_il_ = -1;                          ///< the layer whose experts the buffer holds for its next call, or -1
     std::vector<int32_t> staged_;                 ///< those experts, in the buffer's order: one round of the layer's
     double ahead_ms_ = 0, route_ms_ = 0;          ///< what that layer's copy ahead took, and the card to its routing
@@ -531,6 +625,13 @@ protected:
     std::vector<Run> runs_;        ///< a layer's launches over cached experts whose slots lie one behind the other
     std::vector<int32_t> chan_;    ///< a layer's cached experts in the order of their slots
     std::vector<uint8_t> sent_;
+    // A call that copies only the experts it routes to leaves some of those outside VRAM to the CPU (moe_rows()).
+    std::vector<uint8_t> on_cpu_;  ///< per expert of the layer: the CPU's
+    std::vector<int32_t> spare_;   ///< the layer's routed experts outside VRAM, the fewest tokens' first
+    std::vector<CpuExpert> host_;  ///< their uses, by token
+    double share_[5] = {0.25, 0.25, 0.25, 0.25, 0.25};   ///< the CPU's share of spare_, by the call's tokens:
+                                                         ///< under 64, from 64, 128, 256 and 512
+    std::unique_ptr<Workers> stagers_;   ///< fill the staging buffers meanwhile
 
     // The cache follows what is written (follow()).  It is filled for the average answer; while one is written,
     // the experts it keeps routing to and the cache lacks are copied over the cached ones it uses least, by a
@@ -556,6 +657,7 @@ protected:
     std::vector<size_t> trade_at_;   ///< per trade number: how many of its pairs follow() has taken
 
     int64_t pos_ = 0;
+    const int32_t* tok_ = nullptr;       ///< the tokens of the call under way, a row each as h_rl_ has them (route())
     std::vector<Image> images_;          ///< the sequence's pictures, by row
     uint64_t images_set_ = 0;            ///< counts images(): what was derived from an earlier list is stale
     std::vector<int64_t> use_, prior_;   ///< routed count per (layer, expert): this run, and the profile's

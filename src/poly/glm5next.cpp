@@ -237,6 +237,7 @@ void Glm5Next::load_layer(int il) {
         if (b->type != kTypeF32 || (int64_t) b->elements() != n_expert_)
             throw std::runtime_error(b->name + " is " + shape_of(*b) + ", expected F32 [" +
                                      std::to_string(n_expert_) + "]");
+        B.probs_b_dev = upload(b, blk(il, "exp_probs_b.bias"), n_expert_, 1, kF32);
         home(*b).payload(*b);
         std::memcpy(B.probs_b.data(), home(*b).data(*b), (size_t) n_expert_ * sizeof(float));
     }
@@ -295,7 +296,9 @@ void Glm5Next::alloc_caches() {
     const size_t ring_n = (size_t) ring_ * 2 * idx_dim_;
     float* ring = (float*) dmalloc(n_dsa_ * ring_n * sizeof(float), "the indexer cache");
     float* st = state_;
-    for (Block& B : blocks_) {
+    for (int il = 0; il < (int) blocks_.size(); ++il) {
+        Block& B = blocks_[(size_t) il];
+        if (!runs(il)) continue;
         if (B.dsa) {
             B.lat = (uint16_t*) kv_alloc((size_t) kv_rank_ * sizeof(uint16_t), 1);
             B.pool = (float*) kv_alloc((size_t) idx_dim_ * sizeof(float), kpool_);
@@ -353,11 +356,11 @@ void Glm5Next::save_layer(int il, int64_t pos, uint8_t* dst) {
 }
 
 // A row: the latent the attention reads, and room for a pool's key, which the row that ends the pool has.
-size_t Glm5Next::row_bytes() const {
+size_t Glm5Next::card_row_bytes() const {
     return (size_t) n_dsa_ * ((size_t) kv_rank_ * sizeof(uint16_t) + (size_t) idx_dim_ * sizeof(float));
 }
 
-void Glm5Next::save_rows(int64_t first, int64_t n, uint8_t* dst) {
+void Glm5Next::save_card_rows(int64_t first, int64_t n, uint8_t* dst) {
     if (first < 0 || n < 0 || first + n > opt_.max_context)
         throw std::logic_error("save_rows: the rows are outside the context");
     ck(cudaStreamSynchronize(cs(st_)), "save rows");
@@ -377,7 +380,7 @@ void Glm5Next::save_rows(int64_t first, int64_t n, uint8_t* dst) {
     }
 }
 
-void Glm5Next::load_rows(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n) {
+void Glm5Next::load_card_rows(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n) {
     if (from < 0 || first < from || n < 0 || first + n > from + count || first + n > opt_.max_context)
         throw std::logic_error("load_rows: the rows are outside what was saved");
     cover(first + n);
@@ -489,7 +492,7 @@ void Glm5Next::dense_ffn(Block& B, int il, int n) {
 
 // What ggml's MoE graph does for this model: sigmoid gates, the n_used largest of gate + bias, and weights from
 // the bare gates.
-void Glm5Next::route(int il, const float* logits, int* ids, float* w, float* probs) const {
+void Glm5Next::route(int il, const float* logits, int32_t, int* ids, float* w, float* probs) const {
     const std::vector<float>& bias = blocks_[(size_t) il].probs_b;
     float* pick = probs + n_expert_;
     for (int e = 0; e < n_expert_; ++e) {
@@ -511,6 +514,12 @@ void Glm5Next::route(int il, const float* logits, int* ids, float* w, float* pro
         w[k] /= denom;
         if (w_scale_ != 0.f) w[k] *= w_scale_;
     }
+}
+
+bool Glm5Next::route_card(int il, int n, int32_t* ids, float* w) {
+    const Block& B = blocks_[(size_t) il];
+    route_rows(rl_, n_expert_, n_used_, n, 1, 1.f, fp(B.probs_b_dev), nullptr, w_norm_, w_scale_, ids, w, st_);
+    return true;
 }
 
 // The shared expert.  It runs on the GPU while the host routes.
@@ -544,7 +553,7 @@ void Glm5Next::layer_head(Layer& L, int il, int n) {
         dense_ffn(B, il, n);
         dbg("ffn", il, fo_, n_embd_);
         hc_post(fo_, hcw_, r_, n_embd_, n, st_);
-    } else if (!(mmq_ && n >= kStageRows)) {
+    } else if (!batched(L, n)) {
         moe_router(L, n);
     }
 }

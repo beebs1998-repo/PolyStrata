@@ -11,9 +11,9 @@ namespace strata::poly {
 
 class Glm5Next final : public Engine {
 public:
-    size_t row_bytes() const override;
-    void save_rows(int64_t first, int64_t n, uint8_t* dst) override;
-    void load_rows(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n) override;
+    size_t card_row_bytes() const override;
+    void save_card_rows(int64_t first, int64_t n, uint8_t* dst) override;
+    void load_card_rows(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n) override;
 
 protected:
     void load_geometry() override;
@@ -32,7 +32,8 @@ protected:
     void layer_tail(Layer& L, int il, int n) override;
     void shift_rows(ptrdiff_t by) override;
     void output_rows(int first, int rows, float* h) override;
-    void route(int il, const float* logits, int* ids, float* w, float* tmp) const override;
+    void route(int il, const float* logits, int32_t token, int* ids, float* w, float* tmp) const override;
+    bool route_card(int il, int n, int32_t* ids, float* w) override;
     void moe_shared(const Layer& L, int il, int n) override;
     void block_attend(int64_t pos, int n) override;
     void block_rows(int64_t pos, int n) override;
@@ -58,6 +59,7 @@ private:
         // dense FFN
         Dev ffn_gate, ffn_up, ffn_down;
         std::vector<float> probs_b;   ///< what the routing adds to each expert's gate before it picks
+        Dev probs_b_dev;              ///< the same on the card, when the file has it
     };
 
     void kda(Block& B, int n);
