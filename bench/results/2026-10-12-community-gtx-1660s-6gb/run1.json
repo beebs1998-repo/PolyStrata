@@ -1,0 +1,41 @@
+{
+ "model": "gemma-4-26b-a4b-ud-q2_k_xl",
+ "backend": "gemma4",
+ "quantization": "UD-Q2_K_XL",
+ "context": 8192,
+ "max_tokens": 256,
+ "runs": [
+  {
+   "prompt": "short",
+   "prompt_tokens": 26,
+   "output_tokens": 256,
+   "ttft_s": 0.933,
+   "prefill_tok_s": 31.3,
+   "decode_tok_s": 37.7,
+   "cache_hit_rate": 0.567,
+   "mtp_offered": 222,
+   "mtp_accepted": 148,
+   "mtp_acceptance": 0.667,
+   "vram_peak_gib": 5.23,
+   "ram_peak_gib": 20.05,
+   "gpu_util_mean": 55.6,
+   "cpu_util_mean": 70.3
+  },
+  {
+   "prompt": "long-2000",
+   "prompt_tokens": 2838,
+   "output_tokens": 256,
+   "ttft_s": 16.679,
+   "prefill_tok_s": 171.1,
+   "decode_tok_s": 37.5,
+   "cache_hit_rate": 0.427,
+   "mtp_offered": 194,
+   "mtp_accepted": 154,
+   "mtp_acceptance": 0.794,
+   "vram_peak_gib": 5.3,
+   "ram_peak_gib": 20.36,
+   "gpu_util_mean": 90.5,
+   "cpu_util_mean": 34.6
+  }
+ ]
+}

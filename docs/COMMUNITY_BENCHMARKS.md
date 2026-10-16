@@ -131,6 +131,12 @@ how Strata's comparison ran llama.cpp. The example is for Qwen3.6 UD-Q3_K_M, the
   Source builds of 0.1.40.4 and 0.1.41 on the distribution's ROCm 6.2 (host patches in BUILD.json), IQ2_XS at 131K with KV streaming; decode 24.2/24.0/23.7 tok/s, prompt 350/339/284 tok/s at 4K/32K/128K, two sweeps with telemetry. Build logs trimmed (TRIMMED.md).
 - [2026-10-08: RTX 4070 12 GB, Core i5-12600KF, 32 GB DDR4](../bench/results/2026-10-08-community-rtx4070-iq2-xs/README.md):
   IQ2_XS with adaptive cache E4/S24: 48.23 accepted-decode tok/s (median of 5) on a modified, locally built engine (not an official release; source commit and hashes in provenance.json, steps in REPRODUCE.md).
+- [2026-10-12: GTX 1660 SUPER 6 GB (sm_75), Ryzen 5 3600, 31.9 GB RAM](../bench/results/2026-10-12-community-gtx-1660s-6gb/README.md):
+  Gemma 4 26B-A4B UD-Q2_K_XL on the ready-made `strata-poly`, Windows 10, driver 580.97, context 16,384 and then
+  8,192 for comparison. Writes 35.0 to 39.2 tok/s, reads a 10,982-token prompt at 144 tok/s, 533 of 3,840 experts
+  in VRAM, 21.1 GiB of RAM. Records that every benchmark run spent its answer cap thinking and answered nothing,
+  where setup's own VRAM estimate ran high on this card (about 25% of the experts predicted, 14% actual) and
+  pessimistic about the context.
 
 ## What to record
 
