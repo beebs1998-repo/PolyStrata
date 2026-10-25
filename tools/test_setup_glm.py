@@ -265,6 +265,11 @@ class Main(unittest.TestCase):
                 st.enter_context(p)
             code, out = quiet(setup.main)
         cfg = next(iter(sorted(self.t.glob(f"strata-{setup.FAMILIES[family]['tag']}*.json"))), None)
+        if cfg is None:
+            # a fine-tune --gguf-dir gave: its config takes the model file's name, not the size's
+            ggufs = [p for p in sorted(self.t.glob("strata-*.json"))
+                     if not p.name.endswith(".shared-settings.json")]
+            cfg = ggufs[0] if ggufs else None
         return code, out, (json.loads(cfg.read_text()) if cfg else None)
 
     def test_install(self):

@@ -174,8 +174,30 @@ class Main(unittest.TestCase):
         self.assertEqual(self.verified, [])
         self.assertIn("using Qwen3.6-27B-A3B-CoderX-Q4_K_M.gguf", out)
         self.assertIn("not the Qwen3.6-35B-A3B-UD-Q4_K_M.gguf of this size", out)
+        self.assertIn("run config: strata-qwen3.6-27b-a3b-coderx-q4_k_m.json (named after the model file)", out)
+        self.assertTrue((self.t / "strata-qwen3.6-27b-a3b-coderx-q4_k_m.json").is_file(), out)
+        self.assertEqual(cfg["display_name"], "Qwen3.6-27B-A3B-CoderX-Q4_K_M")
+        self.assertEqual(cfg["model_name"], "qwen3.6-27b-a3b-coderx-q4_k_m")   # its own registry id: the size's
+        # name would sit in two configs when the size is installed beside it, and the newer file wins
         args = cfg["args"]
         self.assertEqual(Path(args[args.index("--model") + 1]), mine / "Qwen3.6-27B-A3B-CoderX-Q4_K_M.gguf")
+
+    def test_a_fine_tune_keeps_the_size_s_conversation_cache(self):
+        """A fine-tune's config (under the model file's name since this naming) reads an install of the size it was
+        picked under: it was the named config of this model before, so the asks it answered stay answered."""
+        family, size = "qwen36", "UD-Q4_K_M"
+        mine = self.t / "coderx"
+        mine.mkdir()
+        (mine / "Qwen3.6-27B-A3B-CoderX-Q4_K_M.gguf").write_bytes(b"GGUF")
+        tag = (setup.FAMILIES[family]["tag"] + size).lower()
+        (self.t / f"strata-{tag}.json").write_text(json.dumps(
+            {"exe": "x/engine-poly/" + setup.POLY_EXE,
+             "args": ["--model", "x.gguf", "--max-context", "32768", "--conversation-cache-mib", "2048"]}))
+        code, out, cfg = self.main(family=family, model=size, argv=("--gguf-dir", str(mine)))
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("Conversation cache:", out)       # answered by the earlier install
+        args = json.loads((self.t / "strata-qwen3.6-27b-a3b-coderx-q4_k_m.json").read_text())["args"]
+        self.assertEqual(args[args.index("--conversation-cache-mib") + 1], "2048")
 
     def test_a_gguf_dir_may_be_the_file_itself(self):
         """--gguf-dir takes a file as well as a folder: the folder that holds several GGUFs is a case naming one of
@@ -190,6 +212,7 @@ class Main(unittest.TestCase):
         code, out, cfg = self.main(family=family, model=size,
                                    argv=("--gguf-dir", str(mine / "gemma-4-26B-A4B-it-Q4_K_L.gguf")))
         self.assertEqual(code, 0, out)
+        self.assertIn("named after the model file", out)
         # the user's file is not checked; the draft model, which setup downloaded into its own folder, is
         draft = Path(setup.FAMILIES[family]["models"][size]["draft_model"]).name
         self.assertEqual([v[0] for v in self.verified], [draft])

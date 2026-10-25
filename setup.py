@@ -6320,24 +6320,12 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
                      f"--family {family} --model {model} --yes installs it anyway")
         warn(f"going on with {ram:.0f} GB of RAM, as you chose")
     ok(f"size: {model}")
-    tag = fam["tag"] + model                           # names of the config, the start script and the data folders
+    tag = fam["tag"] + model                           # names of the data folders (the config takes the model
+                                                       # file's name when --gguf-dir gave one of another name)
 
     if ctx is None:                                   # a small card asked above, before the size it fits with
         ctx = ask_poly_context(fam, a, gpu)
     ok(f"context: {ctx} tokens")
-
-    # the conversation cache: asked once, then kept as the model's run config has it
-    cfg_path = ROOT / f"strata-{tag.lower()}.json"
-    conv = poly_saved_conv([cfg_path, adopted if adopted is not None and adopted.name == cfg_path.name else None])
-    if conv is None:
-        say()
-        say("  Conversation cache: a coding agent sends several conversations in turn (the main one, its subagents,")
-        say("  short side requests). With the cache, one that makes room for another is kept in RAM and comes back")
-        say(f"  without being read again. It takes what it holds, up to {POLY_CONV_CACHE_MIB // 1024} GB of RAM.")
-        room = ram >= need_ram + POLY_CONV_CACHE_MIB / 1024
-        conv = POLY_CONV_CACHE_MIB if ask("Keep several conversations in RAM?", ["y", "n"], "y" if room else "n",
-                                         a.yes) == "y" else 0
-    ok("conversation cache: " + (f"up to {conv} MiB of RAM" if conv else "off (the last conversation is kept)"))
 
     # one file, or the numbered files of a split GGUF: the engine is given the first and finds the others by name
     models_dir = Path(a.models_dir) / tag
@@ -6351,10 +6339,12 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
                  "point --gguf-dir at the file itself or at a folder holding only that one; "
                  "or leave --gguf-dir out and setup downloads the file it knows")
         shards, models_dir = picked
-        if shards[0].name != want[0].name:
+        pinned = want[0].name                       # this size's own file name, for the config name below
+        if shards[0].name != pinned:
             say(f"  using {shards[0].name}, the GGUF it holds, not the {want[0].name} of this size")
     else:
         shards = [models_dir / model_file(fam, model, i) for i in range(1, model_shards(fam, model) + 1)]
+        pinned = shards[0].name
     if not a.gguf_dir and not all(s.exists() and done(s) for s in shards):
         for r in elsewhere:                            # already downloaded in a PolyStrata folder on another drive
             cand = [r / "models" / tag / s.name for s in shards]
@@ -6366,6 +6356,29 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
         if s.exists() and not done(s) and whole_shard(s):
             mark(s, "whole (checked against its own tensor directory)")
     gguf = shards[0]
+    # The run config (and its log) takes the model file's own name when --gguf-dir gave one of another name - a
+    # fine-tune, another quantizer - so it says which model it is, and two files of one size sit side by side under
+    # two configs.  The file setup downloads itself keeps the size's name, as it always did.
+    run_tag = tag.lower()
+    if a.gguf_dir and gguf.name != pinned:
+        run_tag = gguf.stem.lower()
+        ok(f"run config: strata-{run_tag}.json (named after the model file)")
+    # the conversation cache: asked once, then kept as the model's run config has it
+    cfg_path = ROOT / f"strata-{run_tag}.json"
+    size_cfg = ROOT / f"strata-{tag.lower()}.json"    # an install set up before the config took the file's name
+    conv = poly_saved_conv([cfg_path,
+                            size_cfg if run_tag != tag.lower() else None,
+                            adopted if adopted is not None and adopted.name in (cfg_path.name, size_cfg.name)
+                            else None])
+    if conv is None:
+        say()
+        say("  Conversation cache: a coding agent sends several conversations in turn (the main one, its subagents,")
+        say("  short side requests). With the cache, one that makes room for another is kept in RAM and comes back")
+        say(f"  without being read again. It takes what it holds, up to {POLY_CONV_CACHE_MIB // 1024} GB of RAM.")
+        room = ram >= need_ram + POLY_CONV_CACHE_MIB / 1024
+        conv = POLY_CONV_CACHE_MIB if ask("Keep several conversations in RAM?", ["y", "n"], "y" if room else "n",
+                                         a.yes) == "y" else 0
+    ok("conversation cache: " + (f"up to {conv} MiB of RAM" if conv else "off (the last conversation is kept)"))
     have_model = all(s.exists() and (done(s) or bool(a.gguf_dir)) for s in shards)
     # the size's draft model: beside the model's file, or, when --gguf-dir has none, where setup keeps its own
     guesser = models_dir / Path(d["draft_model"]).name if d.get("draft_model") else None
@@ -6491,7 +6504,7 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
            "outside VRAM (--threads in the config)")
     cfg = {"exe": str(eng / POLY_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": f"{fam['name']}-{model.lower()}", "display_name": f"{title} {model}",
-           "log": str(ROOT / f"strata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port}
+           "log": str(ROOT / f"strata-{run_tag}.log"), "lib_dirs": lib_dirs, "port": port}
     if multi:                                          # the server passes --layer-split and orders the cards
         cfg["gpu"], cfg["gpus_asked"] = multi, True
         cfg["layer_split"] = a.layer_split or "auto"
@@ -6507,7 +6520,7 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
         cfg["api_key"] = a.api_key
     if a.browser is not None:
         cfg["open_browser"] = a.browser
-    earlier = adopted if adopted is not None and adopted.name == cfg_path.name else None
+    earlier = adopted if adopted is not None and adopted.name in (cfg_path.name, size_cfg.name) else None
     if vision != "none":
         # the most rows a picture becomes: one of this engine's prompt batches (1,024) holds a picture of Gemma 4's
         vt = vision_tokens(a.vision_tokens, vision, cfg_path if cfg_path.is_file() else earlier)
@@ -6518,9 +6531,13 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
                          "max_tokens": vt}
         if vision == "cpu":
             cfg["vision"]["threads"] = max(1, (os.cpu_count() or 8) // 2)
+    if run_tag != tag.lower():                         # the fine-tune's name in the pick lists, not the size's again
+        cfg["display_name"] = gguf.stem
+        cfg["model_name"] = run_tag                    # in the registry too: two files of one size must keep two
+                                                       # entries (serve/models.py keeps the newer of one name)
     poly_kv_whole(cfg)
     write_setup_config(cfg_path, cfg, earlier)
-    script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
+    script = write_run_script(run_tag, cfg_path, port, cfg.get("open_browser") is not False)
     ok(f"start script: {script.name}")
 
     say()

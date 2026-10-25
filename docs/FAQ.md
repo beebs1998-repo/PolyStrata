@@ -93,7 +93,10 @@ Their numbers are in the
 weights from the GGUF, so a fine-tune that keeps the architecture of Qwen3.6, Ornith 1.5 or Gemma 4 should run.
 Setup only knows the files it offers. To give it another, put the file in a folder under the name of the size
 closest to it, `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` for a Q4_K_M of Qwen3.6, and run setup with
-`--family qwen36 --model UD-Q4_K_M --gguf-dir <that folder>`.
+`--family qwen36 --model UD-Q4_K_M --gguf-dir <that folder>`. A folder that holds one file of another name - the
+name the fine-tune was published under - is taken too. Then setup names the run config after your file
+(`strata-qwen3.6-27b-a3b-coderx-q4_k_m.json`), not the size's name again: the config says which model it is, and two
+files of one size sit side by side under two configs.
 
 ### Can I use any GLM 5.3 Flash GGUF?
 
