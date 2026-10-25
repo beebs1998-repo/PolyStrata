@@ -32,6 +32,12 @@ std::size_t native_q8_1_bytes(int n_in, int ncols = 1);
 // graph capture; captured graphs keep the kernels they captured.
 void native_mmvq_set_multi_exact(bool exact);
 bool native_mmvq_multi_exact();
+// B6 (lab, opt-in STRATA_B6_MMVQ_ROWS=1): the exact multi-column layout with the activation blocks of every column
+// loaded once per weight block and reused across the block's rows (bitwise the same sums as the default exact
+// layout). 0 = off (default), 1 = 2 rows per block, 2 / 4 / 8 = that many rows. Q4_K, Q5_K, Q6_K and IQ4_XS only.
+// Set before graph capture.
+void native_mmvq_set_b6_rows(int mode);
+int native_mmvq_b6_rows();
 
 // One quantization may serve multiple weight matrices sharing the same input.
 // Q8_1 stores FP16 scale and FP16 warp sum of the ORIGINAL float inputs; it does
@@ -160,7 +166,7 @@ bool native_mmvq_ids(int ggml_type, const MmvqIds& ids, int count, int n_in, int
 
 // Storage/dispatch helpers take stable GGML type IDs, avoiding a ggml runtime
 // dependency in the engine: Q4_0=2, Q5_0=6, Q8_0=8, Q2_K=10, Q3_K=11, Q4_K=12, Q5_K=13,
-// Q6_K=14, IQ4_NL=20, IQ4_XS=23, Q2_0=42. Unsupported IDs throw in the byte-count
+// Q6_K=14, IQ4_NL=20, IQ4_XS=23, MXFP4=39, Q2_0=42. Unsupported IDs throw in the byte-count
 // and launch helpers; only the
 // capability query returns false.
 bool native_mmvq_supported(int ggml_type) noexcept;
@@ -179,6 +185,8 @@ constexpr int native_q8_1_il_cp(int ncols) { return ncols <= 2 ? 2 : ncols <= 4 
 std::size_t native_q8_1_il_bytes(int n_in, int ncols);
 // Writes the interleaved copy of 2..4 columns of plain q8_1 blocks (native_quantize_q8_1's, or a fused producer's)
 // to x_il (native_q8_1_il_bytes): the same values in the same bytes.
+/// native_quantize_q8_1 and native_q8_1_interleave in one launch (CUDA): the same bytes in both buffers.
+void native_quantize_q8_1_il(const float* x, void* x_q8_1, void* x_il, int n_in, int ncols, void* stream);
 void native_q8_1_interleave(const void* x_q8_1, void* x_il, int n_in, int ncols, void* stream);
 // True when native_mmvq_il runs its own kernel for this call (IQ4_XS, Q4_K, Q5_K, Q6_K, 2-4 columns, the exact layout).
 bool native_mmvq_il_supported(int ggml_type, int ncols, int n_out);

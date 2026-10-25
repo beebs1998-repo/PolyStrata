@@ -36,8 +36,12 @@ namespace strata::poly {
 class Shards;
 struct Likeliest;
 
-/// The attention caches' storing format: fp16 (default) or ggml Q8_0; opt-in via --kv.
-enum class KvFmt { kFp16 = 0, kQ8_0 = 1 };
+/// The attention caches' storing format, opt-in via --kv.  q8_0 is ggml's blocks (one fp16 scale a 32-value
+/// block of int8 codes) and reads them back element by element; int8 is the same rule with the codes and the
+/// deltas in two arrays, which a reader can take four codes to a load, and int8k keeps only the keys' side
+/// quantized.  q8_0 is qwen35moe's; int8 and int8k are Gemma 4's - the two readers are not the same arithmetic,
+/// so a model has one or the other rather than a choice between them.
+enum class KvFmt { kFp16 = 0, kQ8_0 = 1, kInt8 = 2, kInt8K = 3 };
 
 struct Options {
     std::string model;
@@ -53,6 +57,10 @@ struct Options {
     int stage_mib = 2048;         ///< the buffer the experts that are not cached pass through: by default about
                                   ///< what a layer of Q2_K experts leaves out of the cache, and never more than
                                   ///< a layer's experts take
+    int stage_read_mib = 0;       ///< a read of several calls: the staging buffer grows to this, at most what a
+                                  ///< layer's experts take, with VRAM the expert cache lends it until the read is
+                                  ///< done (end_read()), so that each layer's experts are copied once a read, not
+                                  ///< once a call; 0 (or no more than stage_mib): never
     int stage_ahead = 1024;       ///< from this many tokens, a call routes to most of a layer's experts, and the
                                   ///< ones that are not cached start their copy before the layer has routed; in a
                                   ///< read of several calls and this many tokens every call does; 0: never.  Under
@@ -78,9 +86,14 @@ struct Options {
     int tail_skip = 0;            ///< a routed expert outside VRAM that every token of a call ranks this far down or
                                   ///< further (the router's first choice is 0) is left out (--tail-skip,
                                   ///< STRATA_ROUTE_TAIL_SKIP); 0: none is
+    float skip_weight = 0;        ///< in place of tail_skip: a routed expert outside VRAM whose router weight is under
+                                  ///< this share of its token's experts' weight, for every token of the call, is left
+                                  ///< out (--skip-weight); 0: tail_skip decides
     std::string layer_split;      ///< the layers across the CUDA devices this process sees, in their order: "auto"
                                   ///< (by each card's free VRAM) or the first layer of each later card ("20,30");
                                   ///< empty, or one device: the current card alone
+    int batch = 0;                ///< sequences beside the first, each with a state and caches of its own (bind(),
+                                  ///< step()); 0: one sequence
 };
 
 /// A thing a model's file may call by other names than the engine does: converters differ.
@@ -124,6 +137,8 @@ struct Layer {
     std::vector<void*> shared;         ///< the shared expert
     std::vector<void*> tail;           ///< after the experts
     std::vector<void*> card_moe;       ///< the routed experts, routed on the card (moe_card())
+    /// the head of step()'s rows in one call (Engine::batch_heads()): by the rows, their sequences and head keys
+    std::map<std::vector<int>, void*> rows_heads;
 };
 
 /// A routed expert is run from the VRAM cache or on the CPU when tokens come a few at a time, as an answer's do
@@ -175,9 +190,17 @@ public:
     double numa_share() const { return node_share_; }
     int64_t pos() const { return pos_; }
     int64_t meta_u(const char* key, int64_t fallback) const;
+    /// What --kv asked for, in the two short forms an architecture's code reads: the int8 codes/delta cache
+    /// (both sides, or the keys' side alone under int8k).
+    bool int8() const { return opt_.kv_format == KvFmt::kInt8 || opt_.kv_format == KvFmt::kInt8K; }
+    bool int8k() const { return opt_.kv_format == KvFmt::kInt8K; }
 
     /// Forget the sequence.
     void reset();
+    /// STRATA_FREEZE_EXPERTS: lift the freeze for the caller's own cache change (the serve VRAM
+    /// resize); refreeze_experts() puts it back, and the resized cache is what every request reads.
+    void unfreeze_experts();
+    void refreeze_experts();
     /// The most tokens one eval() takes.
     int max_rows() const { return rows_; }
     /// Feed n tokens from position pos().  With want_logits, logits() then holds the scores of the token after the
@@ -204,6 +227,11 @@ public:
     /// window layer's rows among it.  The caller goes back to a state saved before (load_state()) or resets.
     bool read(const int32_t* tokens, int n, const Mark* marks = nullptr, int n_marks = 0,
               const std::function<bool(int, int)>* turn = nullptr);
+    /// The prompt's reads are done: the expert cache takes back what Options::stage_read_mib lent the staging
+    /// buffer.  window() and step() do it too, if the caller has not.
+    void end_read() {
+        if (stage_lent_) narrow_stage();
+    }
 
     /// Whether the architecture reads pictures.
     virtual bool sees() const { return false; }
@@ -281,6 +309,19 @@ public:
     /// Returns the bytes given back, which mind_vram() hands to the expert cache.
     size_t trim_kv(int64_t end);
     void save_profile() const;
+
+    /// Options::batch + 1 sequences, each with its own position, recurrent state, attention rows and pictures.  One
+    /// is bound at a time, and every call above but step() is the bound one's.  bind(s) leaves the bound one as it
+    /// is and goes on with sequence s where it was left.  Not between window() and keep().
+    int sequences() const { return (int) seqs_.size(); }
+    int bound() const { return bound_; }
+    void bind(int s);
+    /// One token for each of n sequences, together: tokens[i] fed to sequence seqs[i] at its position, as eval()
+    /// with logits would on its own.  logits_of(i) then holds the scores of what follows tokens[i].  The sequences
+    /// differ; none of them has pictures past its position.  The bound sequence stays bound.
+    void step(const int* seqs, const int32_t* tokens, int n);
+    /// Sequence `to` becomes what sequence `from` is: its position, state, rows and pictures, copied on the card.
+    void copy_seq(int from, int to);
 
 protected:
     // ---- what an architecture supplies ----
@@ -360,6 +401,21 @@ protected:
     /// Which recording of a layer's head fits n tokens from pos().  Launches that are sized by the rows they read
     /// are recorded once for each size (room()), and the architecture numbers the sizes from 0.
     virtual int head_key(int il, int n) const { (void) il, (void) n; return 0; }
+    /// layer_head() takes step()'s rows in one call: the products for every row at once, and each row's recurrent
+    /// state and attention rows from its own sequence (rows_of_, seq_state(), seq_buf()), its position from at_.
+    /// Otherwise step() runs the head a row at a time, with the row's sequence bound.
+    virtual bool batch_heads() const { return false; }
+    /// While step() runs a head in one call: each row's sequence and position, row after row; else null.
+    struct Row {
+        int seq;
+        int64_t pos;
+    };
+    const Row* rows_of_ = nullptr;
+    int n_rows_of_ = 0;
+    /// p, a place in the bound sequence's recurrent state, at the same place in sequence s's.
+    float* seq_state(int s, const float* p) const;
+    /// p, a place in one of the bound sequence's buffers (kv_alloc(), seq_alloc()), at the same place in s's.
+    void* seq_buf(int s, const void* p) const;
     /// The rotary position of a row of text: its place in the sequence, unless pictures before it took fewer
     /// positions than rows.
     virtual int64_t turn(int64_t row) const { return row; }
@@ -395,7 +451,6 @@ protected:
     float shape_f(const char* key) const;
     void load_shape();
     void load_moe(int il, bool shared = true);
-    void mxfp4_to_q5_0(int il);
     void alloc();
     void shared_scratch();
     float* draft_input(const int32_t* tokens, int64_t row, const float* h, int n);
@@ -433,9 +488,15 @@ protected:
     int room_key(int n) const;
     void* dmalloc(size_t bytes, const char* what);
     void* hmalloc(size_t bytes, const char* what);
+    /// A write into VRAM, on st_.  Every one of them goes through these two or is an async call on a stream of
+    /// its own: see the note on h2d() in engine.cpp.
+    void h2d(void* dst, const void* src, size_t bytes);
+    void zero_vram(void* dst, size_t bytes);
     /// An attention cache for alloc_caches(): `bytes` for every `per` rows, with addresses for the whole context
     /// and VRAM for the rows the sequence has reached (cover()).
     void* kv_alloc(size_t bytes, int per);
+    /// A buffer of the sequence's own that does not grow with it, such as a window layer's ring of rows.
+    void* seq_alloc(size_t bytes, const char* what);
     /// VRAM in every attention cache for the rows below `end`, before a call writes them.
     void cover(int64_t end);
 
@@ -456,6 +517,8 @@ protected:
     void vmm_free(Mapped& m);
     void shrink_cache(size_t bytes);
     int grow_cache(size_t bytes);
+    void widen_stage();
+    void narrow_stage();
     void resize_card_cache(int mib);   ///< resize_cache() and mind_vram() for this engine's card
     bool mind_card_vram();
     size_t trim_card_kv(int64_t end);
@@ -486,6 +549,10 @@ protected:
     std::thread mapper_;                  ///< reads the experts' pages once after load, so they are mapped
     std::atomic<bool> map_quit_{false};
     void* st_ = nullptr;   ///< the stream everything but the staging ahead runs on
+    bool freeze_experts_ = false;            ///< STRATA_FREEZE_EXPERTS: the experts' split is frozen
+                                             ///< for the engine's whole run (see Engine::load())
+    bool freeze_experts_asked_ = false;      ///< the env was set: refreeze_experts() puts it back after the
+                                             ///< serve VRAM resize lifted it (unfreeze_experts())
     void* blas_ = nullptr; ///< cuBLAS on st_
     void* ev_ = nullptr;   ///< marks the router's copy to the host: ev_row_'s first, or a window's row's own
     void* ev_row_[8] = {}; ///< one for each token a window can have
@@ -521,9 +588,11 @@ protected:
     float rms_eps_ = 0;
     bool gelu_ = false;       ///< the routed experts' activation: GELU of the gate, else SiLU within the layer's limits
     std::vector<float> clamp_exp_, clamp_shexp_;   ///< a layer's SwiGLU limits: the routed experts', the shared one's
+    /// a prompt batch's products go through guard_half_sums(): the model's activations can sum past a half's range
+    /// in a block.  Off for the models whose sums stay in range: it cost LFM2.5 4% of a 30K prompt's read on a 5090.
+    bool half_sum_guard_ = false;
 
     std::vector<Layer> layers_;   ///< the model's, and after them the draft block
-    std::vector<std::unique_ptr<uint8_t[]>> converted_;   ///< experts converted at load (mxfp4_to_q5_0), in RAM
     Dev out_norm_, output_;
     bool draft_ = false;
     bool block_layer_ = false;    ///< what guesses ahead is a block after the model's layers (layers_' last)
@@ -543,6 +612,41 @@ protected:
     std::vector<Kv> kv_;         ///< the attention caches that grow with the sequence
     int64_t kv_rows_ = 0;        ///< the rows they have VRAM for
     int64_t kv_reach_ = 0;       ///< the furthest row cover() was asked for since the last trim_kv()
+    // The sequences (bind()).  The bound one's are the members above and below (pos_, kv_, state_ ...); the
+    // others wait in seqs_, with what alloc_caches() gave them and the launches recorded with their buffers.
+    struct Buf {
+        void* p = nullptr;
+        size_t bytes = 0;   ///< a kv_alloc() buffer's for every `per` rows; a seq_alloc() one's, all of it
+        int per = 0;        ///< 0: seq_alloc()'s
+    };
+    struct Seq {
+        int64_t pos = 0, kv_rows = 0, kv_reach = 0, ahead_pos = -1;
+        int32_t ahead_tok = 0;
+        float* state = nullptr;
+        std::vector<Kv> kv;
+        std::vector<Buf> bufs;
+        std::vector<Image> images;
+        std::vector<std::vector<void*>> heads;   ///< Layer::heads, by layer
+        std::map<std::vector<int>, void*> passes;
+        void* tail = nullptr;
+        // A sequence's own fp16 twin of its int8 caches (Gemma 4's --kv int8), and the halves of it that have
+        // VRAM behind them.  The twin is a sequence's: a batch gives every row its own sequence, and the twin is
+        // where that sequence's prompt batch reads, so the twin belongs with the sequence's other members.
+        Mapped twin_k, twin_v;
+        size_t twin_mapped = 0;
+    };
+    std::vector<Seq> seqs_;      ///< the bound one's place holds nothing while it is bound
+    int bound_ = 0;
+    std::vector<Buf> bufs_;      ///< the bound sequence's: what kv_alloc() and seq_alloc() gave it, in that order
+    size_t again_ = SIZE_MAX;    ///< while alloc_caches() points at the bound sequence's buffers again: the next one
+    // The bound sequence's fp16 twin of its int8 caches (Gemma 4's --kv int8): the addresses for the whole and
+    // the VRAM behind them.  A sequence's own, since a batch gives every row its own sequence.
+    Mapped twin_k_, twin_v_;
+    size_t twin_mapped_ = 0;
+    void park_bound();
+    void take_bound(int s);
+    void hold(int s);   ///< bind() on this card alone
+    size_t other_rows() const;
     size_t budget_ = 0;          ///< their VRAM and the expert cache's together, as the cache was filled
     int asked_reserve_mib_ = -1; ///< Options::vram_reserve_mib as load() got it
     int reserve_mib_ = 0;        ///< what the cache was sized to leave free
@@ -595,6 +699,7 @@ protected:
     // A prompt batch's MoE (moe_rows).  A row is a token and one of the experts it routes to.
     std::unique_ptr<Mmq> mmq_;   ///< null when the card has no MMQ tile for the experts' types
     float *gu_ = nullptr, *hx_ = nullptr, *dx_ = nullptr;   ///< the rows' gate|up, hidden and down values
+    float* hf_ = nullptr;   ///< the power of two a row was divided by for its half sums (guard_half_sums())
     void *mq_ = nullptr, *mq2_ = nullptr;                   ///< the rows quantized for the two products
     void* mqx_ = nullptr;                                   ///< lin()'s tokens quantized for a product
     int32_t *tab_ = nullptr, *h_tab_ = nullptr;   ///< a layer's row tables, in VRAM and pinned
@@ -616,6 +721,10 @@ protected:
     double ahead_ms_ = 0, route_ms_ = 0;          ///< what that layer's copy ahead took, and the card to its routing
     bool shared_ahead_ = false;                   ///< read() runs several calls: each copies ahead, whatever its size
     size_t stage_bytes_ = 0, chunk_bytes_ = 0;
+    Mapped stage_map_;                            ///< stage_'s VRAM when it can grow for a read (stage_read_mib)
+    size_t stage_narrow_ = 0, stage_wide_ = 0;    ///< stage_bytes_ outside a read and inside one
+    bool stage_lent_ = false;                     ///< the expert cache has lent the buffer VRAM (widen_stage())
+    size_t stage_cut_ = 0;                        ///< what the cache gave up for it, which it takes back
     int stage_turn_ = 0;
     std::vector<int32_t> ids_, count_, first_, group_, round_;
     std::vector<float> route_tmp_;   ///< route()'s scratch, a share for each host thread

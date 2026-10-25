@@ -8,6 +8,7 @@
 #pragma once
 
 #include "engine.hpp"
+#include "gdn_mma_control.hpp"
 
 namespace strata::poly {
 
@@ -42,6 +43,7 @@ protected:
     void block_attend(int64_t pos, int n) override;
     void block_rows(int64_t pos, int n) override;
     int head_key(int il, int n) const override;
+    bool batch_heads() const override { return true; }
     int64_t turn(int64_t row) const override;
 
 private:
@@ -68,6 +70,7 @@ private:
 
     void gdn(Block& B, int n);
     void attn(Block& B, int64_t pos, int n);
+    void attn_rows(Block& B, int n);
     void attn_store(Block& B, int64_t pos, int n);
     void turn_of(int64_t row, int32_t* thw) const;
     const int32_t* turns(int64_t pos, int n, int64_t* first);
@@ -83,6 +86,7 @@ private:
     uint64_t axes_set_ = 0;
     int s_dim_ = 0, k_heads_ = 0, v_heads_ = 0, d_inner_ = 0, conv_dim_ = 0;
     int n_gdn_ = 0, n_attn_ = 0;
+    GdnMmaControl gdn_mma_;           ///< captured request and per-engine capability (STRATA_GDN_MMA=1)
     int chunk_ = 1;   ///< tokens the attention takes at a time
 
     // device scratch
@@ -92,6 +96,8 @@ private:
     float* awork_ = nullptr;   ///< a prompt batch's attention (attend_batch)
     float* q8w_ = nullptr;             ///< a q8 prompt batch's K and V blocks, dequantized to fp16 (kwork | vwork)
     size_t work_halves_ = 0;           ///< the halves of each of q8w_'s two halves (kQ8WorkRows rows at most)
+    bool fattn_ = false;               ///< a prompt batch through fattn_q8() / fattn_f16() (STRATA_FATTN=1)
+    bool fdec_ = false;                ///< a few tokens through fdec_q8() / fdec_f16() (STRATA_FDEC=1)
 
 };
 

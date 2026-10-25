@@ -2,13 +2,19 @@
 // llama.cpp's qwen35moe graph.
 #include "qwen35.hpp"
 
+#include "fattn.hpp"
+
 #include "runtime.hpp"
 #include "strata/poly/kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#ifdef STRATA_POLY_GDN_MMA
+#include "gdn_mma.hpp"
+#endif
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace strata::poly {
@@ -36,6 +42,7 @@ void Qwen35::check_draft_block() {
 }
 
 void Qwen35::load_geometry() {
+    gdn_mma_.capture_request();
     load_shape();
     auto find = [&](const char* key) { return meta_in(*gg_, key); };
     auto need = [](bool ok, const char* what) {
@@ -126,7 +133,7 @@ int Qwen35::widest() const { return std::max(d_inner_, n_head_ * head_dim_); }
 
 // The attention layers' caches, and each recurrent layer's convolution and delta-rule state in state_.
 void Qwen35::alloc_caches() {
-    if (opt_.kv_format == KvFmt::kQ8_0) {
+    if (opt_.kv_format == KvFmt::kQ8_0 && !axes_) {
         const size_t row_bytes = (size_t) n_kv_ * head_dim_ + (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t);
         std::fprintf(stderr, "strata-poly: q8_0 KV cache: %zu bytes a row\n", row_bytes);
     }
@@ -154,6 +161,7 @@ void Qwen35::alloc_caches() {
         }
     }
     chunk_ = (int) std::clamp<size_t>(kScoreFloats / ((size_t) n_head_ * opt_.max_context), 1, (size_t) rows_);
+    if (axes_) return;   // bind(): a call's scratch is every sequence's
     axes_ = (int32_t*) dmalloc((size_t) rows_ * 3 * sizeof(int32_t), "a call's rotary positions");
     h_axes_.resize((size_t) rows_ * 3);
 }
@@ -181,6 +189,37 @@ void Qwen35::assign_scratch() {
         // the K and V blocks a q8 prompt batch dequantizes, side by side; work_halves_ halves each
         work_halves_ = kQ8WorkRows * (size_t) n_kv_ * head_dim_;
         q8w_ = fbuf((2 * work_halves_ + 1) / 2);
+    }
+    if (gdn_mma_.initialize([&] {
+#ifdef STRATA_POLY_GDN_MMA
+            return gdn_mma_available(s_dim_, v_heads_, k_heads_);
+#else
+            return false;
+#endif
+        })) {
+        std::fprintf(stderr, "strata-poly: STRATA_GDN_MMA: %s\n",
+                     gdn_mma_.enabled() ? "prefill through chunked GDN MMA; decode and snapshots unchanged"
+#ifdef STRATA_POLY_GDN_MMA
+                                        : "unchanged (unsupported shape, architecture or shared memory)"
+#else
+                                        : "unchanged (requires a CUDA build)"
+#endif
+        );
+    }
+    // STRATA_FATTN=1: a prompt batch through llama.cpp's flash-attention kernel instead, in score_ (fattn.hpp)
+    const char* fa = std::getenv("STRATA_FATTN");
+    if (rows_ >= kStageRows && fa && std::atoi(fa) == 1 && !fattn_) {   // assign_scratch() runs twice: say it once
+        fattn_ = fattn_fits(head_dim_, n_head_, n_kv_, rows_, (size_t) chunk_ * n_head_ * opt_.max_context);
+        std::fprintf(stderr, "strata-poly: STRATA_FATTN: prompt attention %s\n",
+                     fattn_ ? "through llama.cpp's flash-attention kernel"
+                            : "unchanged (no kernel for it on this card, or --prompt-batch too large for the scratch)");
+    }
+    // STRATA_FDEC=1: a few tokens' attention through fdec_q8() / fdec_f16() instead, in score_ (fattn.hpp)
+    const char* fd = std::getenv("STRATA_FDEC");
+    if (fd && std::atoi(fd) == 1 && !fdec_) {
+        fdec_ = fdec_fits(head_dim_, n_head_, n_kv_, (int) opt_.max_context, (size_t) chunk_ * n_head_ * opt_.max_context);
+        std::fprintf(stderr, "strata-poly: STRATA_FDEC: decode attention %s\n",
+                     fdec_ ? "through the tensor-core decode kernel" : "unchanged (no kernel for it on this card)");
     }
 }
 
@@ -280,10 +319,24 @@ void Qwen35::gdn(Block& B, int n) {
     lin(B.wz, xn_, z_, n, xq_);
     lin(B.alpha, xn_, alpha_, n, xq_);
     lin(B.beta, xn_, beta_, n, xq_);
-    conv4_silu(proj_, B.past, fp(B.conv), qkv_, conv_dim_, n, st_,
-               snap_bits_ ? snap_at_ + (B.past - state_) : nullptr, rec_n_, snap_bits_);
-    gdn_step(qkv_, alpha_, beta_, fp(B.dt), fp(B.a), B.s, z_, fp(B.o_norm), gated_, s_dim_, v_heads_, k_heads_, n,
-             rms_eps_, st_, snap_bits_ ? snap_at_ + (B.s - state_) : nullptr, rec_n_, snap_bits_);
+    if (rows_of_) {   // step(): each row with its own sequence's convolution and state
+        for (int i = 0; i < n; ++i) {
+            const int s = rows_of_[i].seq;
+            const size_t c = (size_t) i * conv_dim_, h = (size_t) i * v_heads_, d = (size_t) i * d_inner_;
+            conv4_silu(proj_ + c, seq_state(s, B.past), fp(B.conv), qkv_ + c, conv_dim_, 1, st_);
+            gdn_step(qkv_ + c, alpha_ + h, beta_ + h, fp(B.dt), fp(B.a), seq_state(s, B.s), z_ + d, fp(B.o_norm),
+                     gated_ + d, s_dim_, v_heads_, k_heads_, 1, rms_eps_, st_);
+        }
+    } else {
+        conv4_silu(proj_, B.past, fp(B.conv), qkv_, conv_dim_, n, st_,
+                   snap_bits_ ? snap_at_ + (B.past - state_) : nullptr, rec_n_, snap_bits_);
+#ifdef STRATA_POLY_GDN_MMA
+        if (!(gdn_mma_.enabled() && !recording_ && gdn_mma_step(qkv_, alpha_, beta_, fp(B.dt), fp(B.a), B.s, z_, fp(B.o_norm), gated_,
+                                          s_dim_, v_heads_, k_heads_, n, rms_eps_, st_, snap_bits_ != 0)))
+#endif
+        gdn_step(qkv_, alpha_, beta_, fp(B.dt), fp(B.a), B.s, z_, fp(B.o_norm), gated_, s_dim_, v_heads_, k_heads_, n,
+                 rms_eps_, st_, snap_bits_ ? snap_at_ + (B.s - state_) : nullptr, rec_n_, snap_bits_);
+    }
     lin(B.wo, gated_, ao_, n);
 }
 
@@ -367,6 +420,7 @@ int64_t Qwen35::turn(int64_t row) const {
 }
 
 void Qwen35::attn(Block& B, int64_t pos, int n) {
+    if (rows_of_) return attn_rows(B, n);
     int64_t first;
     const int32_t* axes = turns(pos, n, &first);
     const long long* at = recording_ ? at_ : nullptr;
@@ -384,14 +438,69 @@ void Qwen35::attn(Block& B, int64_t pos, int n) {
         const uint16_t* vc = q8 ? nullptr : B.vals;
         uint16_t* kw = q8 ? (uint16_t*) q8w_ : nullptr;
         uint16_t* vw = q8 ? kw + work_halves_ : nullptr;
-        attend_batch(blas_, q_, kc, vc, pos, n, score_, (size_t) chunk_ * n_head_ * opt_.max_context, awork_,
-                     att_, head_dim_, n_head_, n_kv_, scale, st_, 0, 0, false,
-                     q8 ? Kvq8{B.k_codes, B.k_scales} : Kvq8{}, q8 ? Kvq8{B.v_codes, B.v_scales} : Kvq8{}, kw, vw,
-                     q8 ? work_halves_ : 0);
-    } else
+        const size_t score_floats = (size_t) chunk_ * n_head_ * opt_.max_context;
+        if (!(fattn_ && (q8 ? fattn_q8(q_, Kvq8{B.k_codes, B.k_scales}, Kvq8{B.v_codes, B.v_scales}, pos, n, att_,
+                                       head_dim_, n_head_, n_kv_, scale, score_, score_floats, st_)
+                            : fattn_f16(q_, B.keys, B.vals, pos, n, att_, head_dim_, n_head_, n_kv_, scale, score_,
+                                        score_floats, st_))))
+            attend_batch(blas_, q_, kc, vc, pos, n, score_, score_floats, awork_, att_, head_dim_, n_head_, n_kv_, scale,
+                         st_, 0, 0, false, q8 ? Kvq8{B.k_codes, B.k_scales} : Kvq8{},
+                         q8 ? Kvq8{B.v_codes, B.v_scales} : Kvq8{}, kw, vw, q8 ? work_halves_ : 0);
+    } else if (!(fdec_ && (q8 ? fdec_q8(q_, Kvq8{B.k_codes, B.k_scales}, Kvq8{B.v_codes, B.v_scales}, pos, n, at,
+                                        at ? room(n) : 0, att_, head_dim_, n_head_, n_kv_, scale, score_,
+                                        (size_t) chunk_ * n_head_ * opt_.max_context, st_)
+                              : fdec_f16(q_, B.keys, B.vals, pos, n, at, at ? room(n) : 0, att_, head_dim_, n_head_,
+                                         n_kv_, scale, score_, (size_t) chunk_ * n_head_ * opt_.max_context, st_))))
         attend(q_, q8 ? nullptr : B.keys, q8 ? nullptr : B.vals, pos, n, score_, chunk_, att_, head_dim_, n_head_,
                n_kv_, scale, st_, 0, 0, false, at, at ? room(n) : 0, /*score_floats*/ 0,
                q8 ? Kvq8{B.k_codes, B.k_scales} : Kvq8{}, q8 ? Kvq8{B.v_codes, B.v_scales} : Kvq8{});
+    mul_sigmoid(att_, qg_ + head_dim_, head_dim_, n * n_head_, 2 * head_dim_, false, st_);
+    lin(B.wo, att_, ao_, n);
+}
+
+// step()'s rows, each of its own sequence: the products for all of them at once, each row's position from at_, and
+// each row's keys and values stored and attended to in its own sequence's caches.
+void Qwen35::attn_rows(Block& B, int n) {
+    const long long* at = at_;
+    lin(B.wq, xn_, qg_, n, xq_);
+    lin(B.wk, xn_, kraw_, n, xq_);
+    lin(B.wv, xn_, v_, n, xq_);
+    const float scale = 1.f / std::sqrt((float) head_dim_);
+    const bool q8 = opt_.kv_format == KvFmt::kQ8_0;
+    const size_t kv = (size_t) n_kv_ * head_dim_, hq = (size_t) n_head_ * head_dim_;
+    for (int i = 0; i < n; ++i) {
+        const Row& r = rows_of_[i];
+        const long long* ai = at + 2 * i;
+        // a row at a time: the turn takes one position and counts on from it, which suits a window's rows only
+        head_norm_rope(qg_ + 2 * i * hq, 2 * head_dim_, fp(B.q_norm), q_ + i * hq, head_dim_, n_head_, n_rot_,
+                       theta_scale_, 0, 1, rms_eps_, st_, nullptr, nullptr, sections_, ai + 1);
+        head_norm_rope(kraw_ + i * kv, head_dim_, fp(B.k_norm), k_ + i * kv, head_dim_, n_kv_, n_rot_, theta_scale_, 0, 1,
+                       rms_eps_, st_, nullptr, nullptr, sections_, ai + 1);
+        Kvq8 kq{}, vq{};
+        uint16_t *kc = nullptr, *vc = nullptr;
+        if (q8) {
+            kq = {(int8_t*) seq_buf(r.seq, B.k_codes), (uint16_t*) seq_buf(r.seq, B.k_scales)};
+            vq = {(int8_t*) seq_buf(r.seq, B.v_codes), (uint16_t*) seq_buf(r.seq, B.v_scales)};
+            store_q8_at(k_ + i * kv, (int8_t*) kq.codes, (uint16_t*) kq.scales, (int) kv, ai, 1, 0, st_);
+            store_q8_at(v_ + i * kv, (int8_t*) vq.codes, (uint16_t*) vq.scales, (int) kv, ai, 1, 0, st_);
+        } else {
+            kc = (uint16_t*) seq_buf(r.seq, B.keys);
+            vc = (uint16_t*) seq_buf(r.seq, B.vals);
+            store_f16_at(k_ + i * kv, kc, (int) kv, ai, 1, 0, st_);
+            store_f16_at(v_ + i * kv, vc, (int) kv, ai, 1, 0, st_);
+        }
+        const int64_t keep = pos_;
+        pos_ = r.pos;
+        const int sized = room(1);
+        pos_ = keep;
+        const size_t sf = (size_t) chunk_ * n_head_ * opt_.max_context;
+        if (!(fdec_ && (q8 ? fdec_q8(q_ + i * hq, kq, vq, r.pos, 1, ai, sized, att_ + i * hq, head_dim_, n_head_, n_kv_,
+                                     scale, score_, sf, st_)
+                           : fdec_f16(q_ + i * hq, kc, vc, r.pos, 1, ai, sized, att_ + i * hq, head_dim_, n_head_,
+                                      n_kv_, scale, score_, sf, st_))))
+            attend(q_ + i * hq, kc, vc, r.pos, 1, score_, chunk_, att_ + i * hq, head_dim_, n_head_, n_kv_, scale, st_,
+                   0, 0, false, ai, sized, 0, kq, vq);
+    }
     mul_sigmoid(att_, qg_ + head_dim_, head_dim_, n * n_head_, 2 * head_dim_, false, st_);
     lin(B.wo, att_, ao_, n);
 }
