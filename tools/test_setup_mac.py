@@ -267,6 +267,7 @@ class Source(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, \
                 mock.patch.object(setup, "data_folder", lambda requested: (Path(tmp), [])), \
                 mock.patch("subprocess.run", fake_run(M5)), \
+                mock.patch.object(M.platform, "machine", return_value="arm64"), \
                 mock.patch.object(setup, "warn", lambda *a, **k: warnings.append(" ".join(str(x) for x in a))), \
                 mock.patch.object(setup, "say", lambda *a, **k: None), \
                 mock.patch.object(setup, "ok", lambda *a, **k: None), \

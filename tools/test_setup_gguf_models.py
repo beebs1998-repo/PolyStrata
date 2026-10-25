@@ -171,7 +171,9 @@ class Main(unittest.TestCase):
         self.downloads, self.runs, self.verified = [], [], []
         code, out, cfg = self.main(family=family, model=size, argv=("--gguf-dir", str(mine)))
         self.assertEqual(code, 0, out)
-        self.assertEqual(self.verified, [])
+        # a fine-tune of another name is judged against the size's pinned values: setup says it is not the file
+        # it offers, and takes it once its header says it is a whole GGUF of the family's architecture
+        self.assertEqual(self.verified, [("Qwen3.6-27B-A3B-CoderX-Q4_K_M.gguf", *fam["sha256"][setup.model_file(fam, size, 1)])])
         self.assertIn("using Qwen3.6-27B-A3B-CoderX-Q4_K_M.gguf", out)
         self.assertIn("not the Qwen3.6-35B-A3B-UD-Q4_K_M.gguf of this size", out)
         self.assertIn("run config: strata-qwen3.6-27b-a3b-coderx-q4_k_m.json (named after the model file)", out)
@@ -213,9 +215,10 @@ class Main(unittest.TestCase):
                                    argv=("--gguf-dir", str(mine / "gemma-4-26B-A4B-it-Q4_K_L.gguf")))
         self.assertEqual(code, 0, out)
         self.assertIn("named after the model file", out)
-        # the user's file is not checked; the draft model, which setup downloaded into its own folder, is
+        # the user's file is judged against the size's pinned values (and never deleted); the draft model, which
+        # setup downloaded into its own folder, is judged by its own
         draft = Path(setup.FAMILIES[family]["models"][size]["draft_model"]).name
-        self.assertEqual([v[0] for v in self.verified], [draft])
+        self.assertEqual([v[0] for v in self.verified], ["gemma-4-26B-A4B-it-Q4_K_L.gguf", draft])
         self.assertEqual(Path(cfg["args"][cfg["args"].index("--model") + 1]),
                          mine / "gemma-4-26B-A4B-it-Q4_K_L.gguf")
 
@@ -259,10 +262,11 @@ class Main(unittest.TestCase):
         (split / "only.gguf").write_bytes(b"")
         self.assertIsNone(pick(split, [split / "-00001-of-00004.gguf", split / "-00002-of-00004.gguf"]))
 
-    def test_a_file_from_gguf_dir_is_not_checked(self):
-        """#--gguf-dir: a file the user brings is under the name of the size closest to it and has none of setup's
-        pinned SHA-256, so setup must not check it - and must not delete it over one (verify_sha256 unlinks a file
-        whose hash differs).  What docs/FAQ.md tells people to do, and what the Qwen engine's path already does."""
+    def test_a_file_from_gguf_dir_is_judged_and_kept(self):
+        """#--gguf-dir: a file the user brings is under the name of the size closest to it and is judged against
+        that size's pinned size and SHA-256 (verify_poly_own takes it once its header says it is a whole GGUF of
+        the family's architecture, docs/FAQ.md) - and it is never deleted, where verify_sha256 unlinks a file
+        setup downloaded itself whose hash differs."""
         family = "qwen36"
         size, file = "UD-Q4_K_M", "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
         fam = setup.FAMILIES[family]
@@ -272,16 +276,15 @@ class Main(unittest.TestCase):
         self.downloads, self.runs, self.verified = [], [], []
         code, out, cfg = self.main(family=family, model=size, argv=("--gguf-dir", str(folder)))
         self.assertEqual(code, 0, out)
-        self.assertEqual(self.verified, [])            # not checked: setup has no hash for it
+        self.assertEqual(self.verified, [(file, *fam["sha256"][file])])   # judged against the size's pinned values
         self.assertEqual(self.downloads, [])           # and not fetched either
-        self.assertIn("--gguf-dir: not one of setup's pinned files", out)
         self.assertTrue((folder / file).exists(), "setup deleted the file the user brought")
         args = cfg["args"]
         self.assertEqual(Path(args[args.index("--model") + 1]), folder / file)
 
-    def test_a_draft_model_from_gguf_dir_is_not_checked(self):
-        """Gemma 4's draft model is a second file beside the model's: --gguf-dir can name that one too, and its
-        SHA-256 is guarded the same way."""
+    def test_a_draft_model_from_gguf_dir_is_judged_the_same(self):
+        """Gemma 4's draft model is a second file beside the model's: --gguf-dir can name that one too, and both it
+        and the model are judged against the sizes' pinned values (docs/FAQ.md)."""
         family = "gemma4"
         size = "UD-Q3_K_M"
         fam = setup.FAMILIES[family]
@@ -294,7 +297,7 @@ class Main(unittest.TestCase):
         self.downloads, self.runs, self.verified = [], [], []
         code, out, cfg = self.main(family=family, model=size, argv=("--gguf-dir", str(folder)))
         self.assertEqual(code, 0, out)
-        self.assertEqual(self.verified, [])
+        self.assertEqual(self.verified, [(file, *fam["sha256"][file]), (draft, *fam["sha256"][draft])])
         self.assertEqual(self.downloads, [])
         self.assertTrue((folder / draft).exists(), "setup deleted the draft model the user brought")
         self.assertEqual(Path(cfg["args"][cfg["args"].index("--draft-model") + 1]), folder / draft)
@@ -389,14 +392,14 @@ class Main(unittest.TestCase):
         self.downloads, self.verified = [], []
         code, out, cfg = self.main(["--gguf-dir", str(mine)], family="gemma4", ram=32.0, vram=8.0)
         self.assertEqual((code, self.downloads), (0, []), out)
-        # both files are now the user's, under --gguf-dir, so neither is checked: setup has no pinned hash for
-        # either, and verify_sha256 would delete a file whose hash differs
-        self.assertEqual(self.verified, [])
+        # both files are now the user's, under --gguf-dir: both are judged against their sizes' pinned values
+        # (the header check of verify_poly_own), and setup still deletes none of them
+        self.assertEqual([v[0] for v in self.verified], [Path(file).name, Path(guesser).name])
         self.assertEqual(Path(cfg["args"][cfg["args"].index("--draft-model") + 1]), mine / Path(guesser).name)
 
     def test_a_draft_model_setup_downloaded_is_still_checked(self):
-        """The other side of that: a file setup fetched itself, into its own models folder, is a pinned file and is
-        checked whatever --gguf-dir said about the model's own file."""
+        """The other side of that: the model's file the user brought is judged against the size's pinned values,
+        and the draft model setup fetched itself, into its own models folder, by its own."""
         size, file, _repo, _n = NEW["gemma4"]
         fam = setup.FAMILIES["gemma4"]
         guesser = fam["models"][size]["draft_model"]
@@ -406,8 +409,7 @@ class Main(unittest.TestCase):
         self.downloads, self.verified = [], []
         code, out, cfg = self.main(["--gguf-dir", str(mine)], family="gemma4", ram=32.0, vram=8.0)
         self.assertEqual(code, 0, out)
-        self.assertEqual([v[0] for v in self.verified], [Path(guesser).name])   # not the user's file
-        self.assertIn("--gguf-dir:", out)
+        self.assertEqual([v[0] for v in self.verified], [Path(file).name, Path(guesser).name])
 
     def test_a_pc_below_the_qwen_models_ram_is_not_stopped(self):
         # 24 GB is under what the smallest Qwen3.8 size needs, and enough for these by their own estimate

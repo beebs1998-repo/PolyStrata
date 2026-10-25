@@ -6873,11 +6873,15 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
             return
         verify_sha256(path, *fam["sha256"][sha_key], own=bool(a.gguf_dir) and path.parent == models_dir)
 
+    # A file --gguf-dir names under one of its size's names is judged against that size's pinned size and SHA-256
+    # (verify_poly_own).  One of another name - a fine-tune `pinned` did not name - is judged against the size's
+    # values all the same: setup says it is not the file it offers, and takes it once it is a whole GGUF of the
+    # family's architecture (docs/FAQ.md).  Nothing in that folder is deleted either way.
     for s in shards:
         if _sg:
             continue                    # user-supplied file: no sha256 to match
         elif a.gguf_dir:
-            verify_poly_own(s, *fam["sha256"][s.name], family)
+            verify_poly_own(s, *fam["sha256"][s.name if s.name in fam["sha256"] else pinned], family)
         else:
             verify_poly_download(s, *fam["sha256"][s.name], family)
     if guesser is not None:
